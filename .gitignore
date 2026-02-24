@@ -1,0 +1,26 @@
+# Environnements virtuels
+venv/
+.env
+.env.local
+.env.development
+.env.production
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Fichiers audio générés
+*.wav
+*.mp3
+
+# Cache Hugging Face / modèles
+.cache/
+.huggingface/
+
+# Autres fichiers temporaires
+*.log
+*.tmp
+.DS_Store  # Mac
+Thumbs.db  # Windows
