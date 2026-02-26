@@ -1,4 +1,4 @@
-# 🎙️ TTS Project — Text-to-Speech with Kokoro v0.19
+# 🎙️ TTS Project — Text-to-Speech with Kokoro-82M (kokoro 0.9.4)
 
 🇫🇷 [Version française](README.fr.md)
 
@@ -12,7 +12,7 @@ The user types a text, chooses a language and a voice, and generates an audio fi
 User → React (port 5173)
            ↓ Axios POST /tts
       FastAPI (port 8000)
-           ↓ Kokoro v0.19
+           ↓ Kokoro-82M (kokoro 0.9.4)
       WAV Audio Generation
            ↓
       Player + Download

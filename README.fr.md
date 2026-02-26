@@ -1,4 +1,4 @@
-# 🎙️ Projet TTS — Text-to-Speech avec Kokoro v0.19
+# 🎙️ Projet TTS — Text-to-Speech avec Kokoro-82M (kokoro 0.9.4)
 
 Application web de synthèse vocale qui transforme du texte en audio naturel.
 L'utilisateur saisit un texte, choisit une langue et une voix, et génère un fichier audio qu'il peut écouter et télécharger.
@@ -10,7 +10,7 @@ L'utilisateur saisit un texte, choisit une langue et une voix, et génère un fi
 Utilisateur → React (port 5173)
                   ↓ Axios POST /tts
              FastAPI (port 8000)
-                  ↓ Kokoro v0.19
+                  ↓ Kokoro-82M (kokoro 0.9.4)
              Génération audio WAV
                   ↓
              Player + Téléchargement
@@ -31,7 +31,7 @@ Le projet est séparé en deux parties indépendantes qui communiquent via une A
 | FastAPI | Framework API REST |
 | Uvicorn | Serveur HTTP |
 | Pydantic | Validation des données |
-| Kokoro v0.19 | Modèle Text-to-Speech |
+| Kokoro-82M (kokoro 0.9.4) | Modèle Text-to-Speech |
 | soundfile | Écriture fichiers audio |
 | React | Framework frontend |
 | Vite | Outil de build |
