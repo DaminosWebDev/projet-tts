@@ -29,3 +29,10 @@ audio_files/
 
 # Windows
 Thumbs.db
+
+# Node modules (à la racine par erreur)
+node_modules/
+package-lock.json
+
+# Fichiers de test temporaires
+Premier test/
