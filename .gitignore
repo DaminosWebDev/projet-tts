@@ -12,6 +12,7 @@ __pycache__/
 *.pyd
 
 # Fichiers audio générés
+audio_files/
 *.wav
 *.mp3
 
@@ -22,5 +23,9 @@ __pycache__/
 # Autres fichiers temporaires
 *.log
 *.tmp
-.DS_Store  # Mac
-Thumbs.db  # Windows
+
+# Mac
+.DS_Store
+
+# Windows
+Thumbs.db
