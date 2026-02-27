@@ -13,10 +13,10 @@ from config import (
     HOST,
     PORT,
     MAX_TEXT_LENGTH,
-    AUDIO_DIR,
+    TTS_OUTPUT_DIR,
     LOG_LEVEL
 )
-from tts_service import generate_audio, get_available_voices
+from tts.tts_service import generate_audio, get_available_voices
 
 # --- Configuration des logs ---
 # basicConfig configure le format des messages de log
@@ -56,8 +56,8 @@ app.add_middleware(
 # --- Création du dossier audio au démarrage ---
 # On s'assure que le dossier audio_files existe avant de démarrer
 # exist_ok=True = pas d'erreur si le dossier existe déjà
-os.makedirs(AUDIO_DIR, exist_ok=True)
-logger.info(f"Dossier audio prêt : {AUDIO_DIR}")
+os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
+logger.info(f"Dossier audio prêt : {TTS_OUTPUT_DIR}")
 
 
 # --- Modèle de données pour les requêtes ---
@@ -225,7 +225,7 @@ def download_audio(filename: str):
     Télécharge un fichier audio précédemment généré via son nom de fichier.
     """
     # On reconstruit le chemin complet vers le fichier
-    filepath = os.path.join(AUDIO_DIR, filename)
+    filepath = os.path.join(TTS_OUTPUT_DIR, filename)
 
     # Sécurité : on vérifie que le fichier existe avant de le retourner
     if not os.path.exists(filepath):
