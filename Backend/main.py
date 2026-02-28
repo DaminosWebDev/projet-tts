@@ -54,6 +54,7 @@ from config import (
 from tts.tts_service import generate_audio, get_available_voices
 from stt.stt_service import transcribe_audio, get_supported_languages
 from youtube.youtube_service import download_youtube, transcribe_youtube_audio
+from translation.translate_service import translate_segments, translate_text
 
 
 
@@ -482,26 +483,22 @@ class YouTubeRequest(BaseModel):
 @app.post("/youtube/process")
 async def youtube_process(request: YouTubeRequest):
     """
-    Lance le pipeline YouTube complet (pour l'instant : étapes B et C)
-    - Télécharge la vidéo et l'audio
-    - Transcrit l'audio avec timestamps
-
-    On utilisera async car les opérations de téléchargement et transcription
-    sont longues — async permet au serveur de continuer à répondre
-    à d'autres requêtes pendant ce temps
+    Pipeline YouTube — étapes B, C et D :
+    - Télécharge la vidéo et l'audio (étape B)
+    - Transcrit l'audio avec timestamps (étape C)
+    - Traduit les segments (étape D)
+    
+    Utilise async car les opérations sont longues — le serveur
+    continue de répondre à d'autres requêtes pendant ce temps.
     """
 
-    # Génération d'un job_id unique pour ce traitement
     job_id = str(uuid.uuid4())[:8]
+    logger.info(f"Nouveau job YouTube : {job_id} | url={request.url}")
     # uuid.uuid4() génère un UUID aléatoire
     # [:8] = on garde seulement les 8 premiers caractères
     # Ex: "a3f8c2d1" → suffisant pour être unique dans notre contexte
-
-    logger.info(f"Nouveau job YouTube : {job_id} | url={request.url}")
-
     # --- Étape B : Téléchargement ---
     download_result = download_youtube(request.url, job_id)
-
     if not download_result["success"]:
         raise HTTPException(
             status_code=500,
@@ -513,14 +510,27 @@ async def youtube_process(request: YouTubeRequest):
         download_result["audio_path"],
         source_language=request.source_language
     )
-
     if not transcribe_result["success"]:
         raise HTTPException(
             status_code=500,
             detail=f"Erreur transcription : {transcribe_result['error']}"
         )
 
-    # On retourne toutes les infos utiles pour vérifier dans Postman
+    # --- Étape D : Traduction ---
+    # await = on attend que la traduction async soit terminée
+    # POURQUOI await ici ? translate_segments est une fonction async
+    # On doit toujours await une fonction async pour obtenir son résultat
+    translate_result = await translate_segments(
+        segments=transcribe_result["segments"],
+        source_lang=transcribe_result["language"],
+        target_lang=request.target_language
+    )
+    if not translate_result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur traduction : {translate_result['error']}"
+        )
+
     return {
         "success": True,
         "job_id": job_id,
@@ -533,11 +543,14 @@ async def youtube_process(request: YouTubeRequest):
             "language": transcribe_result["language"],
             "language_probability": transcribe_result["language_probability"],
             "segments_count": len(transcribe_result["segments"]),
-            "segments": transcribe_result["segments"]
-            # On retourne TOUS les segments pour pouvoir les vérifier dans Postman
+        },
+        "translation": {
+            "source_lang": translate_result["source_lang"],
+            "target_lang": translate_result["target_lang"],
+            "segments_count": len(translate_result["segments"]),
+            "segments": translate_result["segments"]
         }
     }
-
 
 # --- Point d'entrée du programme ---
 # Ce bloc s'exécute uniquement quand on lance "python main.py" directement
