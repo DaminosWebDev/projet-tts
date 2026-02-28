@@ -3,17 +3,23 @@
 # main.py appellera les fonctions d'ici sans avoir besoin de savoir comment Kokoro fonctionne
 
 from dotenv import load_dotenv
+import sys
 import os
 import logging
 import uuid
 import time
 import soundfile as sf
 from kokoro import KPipeline
+
+# On remonte d'un niveau pour accéder à config.py qui est dans BACKEND/
+# tts_service.py est dans BACKEND/tts/ donc on remonte à BACKEND/
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import (
     DEFAULT_VOICE_FR,
     DEFAULT_VOICE_EN,
     DEFAULT_SPEED,
-    AUDIO_DIR,
+    TTS_OUTPUT_DIR,
     AUDIO_FORMAT
 )
 
@@ -116,7 +122,7 @@ def generate_audio(text: str, language: str = "fr", voice: str = "", speed: floa
         # Ça évite d'avoir des conflits si deux utilisateurs génèrent en même temps
         unique_id = str(uuid.uuid4())[:8]  # On prend seulement les 8 premiers caractères
         filename = f"audio_{unique_id}.{AUDIO_FORMAT}"
-        filepath = os.path.join(AUDIO_DIR, filename)
+        filepath = os.path.join(TTS_OUTPUT_DIR, filename)
         # os.path.join construit le chemin correct selon l'OS
         # Sur Windows : "audio_files\audio_a3f8c2d1.wav"
         # Sur Linux   : "audio_files/audio_a3f8c2d1.wav"
