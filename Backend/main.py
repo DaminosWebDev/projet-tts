@@ -17,7 +17,9 @@ from config import (
     TTS_OUTPUT_DIR,
     STT_UPLOAD_DIR,
     STT_MAX_FILE_SIZE_MB,
-    LOG_LEVEL
+    LOG_LEVEL,
+    YOUTUBE_TEMP_DIR,    
+    YOUTUBE_OUTPUT_DIR 
 )
 from tts.tts_service import generate_audio, get_available_voices
 from stt.stt_service import transcribe_audio, get_supported_languages
@@ -68,6 +70,11 @@ logger.info(f"Dossier audio prêt : {TTS_OUTPUT_DIR}")
 # Création du dossier uploads STT au démarrage
 os.makedirs(STT_UPLOAD_DIR, exist_ok=True)
 logger.info(f"Dossier STT uploads prêt : {STT_UPLOAD_DIR}")
+# Après les makedirs existants
+os.makedirs(YOUTUBE_TEMP_DIR, exist_ok=True)
+logger.info(f"Dossier YouTube temp prêt : {YOUTUBE_TEMP_DIR}")
+os.makedirs(YOUTUBE_OUTPUT_DIR, exist_ok=True)
+logger.info(f"Dossier YouTube outputs prêt : {YOUTUBE_OUTPUT_DIR}")
 
 
 # --- Modèle de données pour les requêtes ---

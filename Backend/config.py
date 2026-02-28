@@ -32,3 +32,20 @@ STT_UPLOAD_DIR = "stt/uploads"  # Dossier où les fichiers audio uploadés sont 
 
 # --- Logs ---
 LOG_LEVEL = "INFO"   # Niveau de détail des logs : DEBUG (très verbeux) > INFO > WARNING > ERROR
+
+# --- YouTube ---
+YOUTUBE_TEMP_DIR = "youtube/temp"
+YOUTUBE_OUTPUT_DIR = "youtube/outputs"
+
+# --- LibreTranslate ---
+LIBRETRANSLATE_URL = "http://localhost:5000"
+LIBRETRANSLATE_API_KEY = ""
+
+# --- Time-stretching ---
+# Tolérance avant d'appliquer le stretching
+# 0.20 = on accepte ±20% de différence sans modifier l'audio
+STRETCH_TOLERANCE = 0.20
+
+# --- Whisper YouTube ---
+# On utilise un modèle plus précis pour la synchro vidéo
+YOUTUBE_WHISPER_MODEL = "medium"
