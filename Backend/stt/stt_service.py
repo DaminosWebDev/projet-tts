@@ -7,9 +7,6 @@ import os
 import logging
 import time
 
-# On remonte d'un niveau pour accéder à config.py qui est dans BACKEND/
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from faster_whisper import WhisperModel
 from config import (
     STT_MODEL_SIZE,

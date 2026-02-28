@@ -11,10 +11,6 @@ import time
 import soundfile as sf
 from kokoro import KPipeline
 
-# On remonte d'un niveau pour accéder à config.py qui est dans BACKEND/
-# tts_service.py est dans BACKEND/tts/ donc on remonte à BACKEND/
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from config import (
     DEFAULT_VOICE_FR,
     DEFAULT_VOICE_EN,
