@@ -30,7 +30,7 @@ logger.info("Chargement des pipelines Kokoro...")
 pipeline_fr = KPipeline(lang_code='f', repo_id='hexgrad/Kokoro-82M')
 logger.info("Pipeline français chargé")
 
-pipeline_en = KPipeline(lang_code='a')
+pipeline_en = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
 logger.info("Pipeline anglais chargé")
 
 AVAILABLE_VOICES = {

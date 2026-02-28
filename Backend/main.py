@@ -5,11 +5,35 @@
 import os
 import logging
 import uvicorn
-import uuid  # Pour générer des identifiants uniques pour les fichiers uploadés
-from fastapi import FastAPI, HTTPException
+import uuid
+from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import shutil
+
+# =============================================================================
+# ÉTAPE 1 : Logging EN PREMIER — avant tout le reste
+# POURQUOI ? Quand Python importe tts_service, stt_service, youtube_service,
+# ces fichiers appellent logger.info() immédiatement au chargement.
+# Si logging n'est pas configuré à ce moment, ces messages sont perdus.
+# On utilise logging.INFO directement (pas LOG_LEVEL) car config
+# n'est pas encore importé à ce stade.
+# =============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    # logging.INFO est une constante intégrée à Python
+    # On ne peut pas utiliser LOG_LEVEL ici car config.py
+    # n'est pas encore importé — ce serait une NameError
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# ÉTAPE 2 : Config — après logging, avant les services
+# POURQUOI ? Les services importent depuis config.py
+# Il faut que config soit chargé avant eux
+# =============================================================================
 from config import (
     HOST,
     PORT,
@@ -18,26 +42,20 @@ from config import (
     STT_UPLOAD_DIR,
     STT_MAX_FILE_SIZE_MB,
     LOG_LEVEL,
-    YOUTUBE_TEMP_DIR,    
-    YOUTUBE_OUTPUT_DIR 
+    YOUTUBE_TEMP_DIR,
+    YOUTUBE_OUTPUT_DIR
 )
+
+# =============================================================================
+# ÉTAPE 3 : Services — après logging ET config
+# C'est ici que les modèles IA se chargent en mémoire GPU
+# Leurs logs apparaîtront maintenant car logging est déjà configuré
+# =============================================================================
 from tts.tts_service import generate_audio, get_available_voices
 from stt.stt_service import transcribe_audio, get_supported_languages
-from fastapi import File, UploadFile
-import shutil
-# shutil = module Python pour manipuler les fichiers (copier, déplacer, supprimer)
+from youtube.youtube_service import download_youtube, transcribe_youtube_audio
 
-# --- Configuration des logs ---
-# basicConfig configure le format des messages de log
-# %(asctime)s   = heure du message
-# %(name)s      = nom du fichier qui a émis le log (ex: "tts_service")
-# %(levelname)s = niveau du log (INFO, ERROR, etc.)
-# %(message)s   = le message lui-même
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),  # On convertit le string "INFO" en constante logging.INFO
-    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s"
-)
-logger = logging.getLogger(__name__)
+
 
 # --- Création de l'application FastAPI ---
 # C'est l'objet principal de notre API
@@ -431,6 +449,93 @@ async def speech_to_text_record(
         "language_probability": result["language_probability"],
         "segments": result["segments"],
         "duration": result["duration"]
+    }
+
+
+
+# ===========================================================================
+# ENDPOINTS YOUTUBE
+# ===========================================================================
+
+class YouTubeRequest(BaseModel):
+    # BaseModel = classe Pydantic qui valide automatiquement les données reçues
+    # Si l'URL est manquante → FastAPI retourne une erreur 422 automatiquement
+
+    url: str = Field(
+        ...,
+        # "..." = champ obligatoire (ne peut pas être vide)
+        description="URL complète de la vidéo YouTube"
+    )
+    source_language: str = Field(
+        default=None,
+        # None = détection automatique de la langue par Whisper
+        description="Langue de la vidéo : 'fr', 'en', etc. (None = auto)"
+    )
+    target_language: str = Field(
+        default="fr",
+        # La langue dans laquelle on veut traduire
+        # "fr" par défaut = on traduit tout en français
+        description="Langue cible de la traduction"
+    )
+
+
+@app.post("/youtube/process")
+async def youtube_process(request: YouTubeRequest):
+    """
+    Lance le pipeline YouTube complet (pour l'instant : étapes B et C)
+    - Télécharge la vidéo et l'audio
+    - Transcrit l'audio avec timestamps
+
+    On utilisera async car les opérations de téléchargement et transcription
+    sont longues — async permet au serveur de continuer à répondre
+    à d'autres requêtes pendant ce temps
+    """
+
+    # Génération d'un job_id unique pour ce traitement
+    job_id = str(uuid.uuid4())[:8]
+    # uuid.uuid4() génère un UUID aléatoire
+    # [:8] = on garde seulement les 8 premiers caractères
+    # Ex: "a3f8c2d1" → suffisant pour être unique dans notre contexte
+
+    logger.info(f"Nouveau job YouTube : {job_id} | url={request.url}")
+
+    # --- Étape B : Téléchargement ---
+    download_result = download_youtube(request.url, job_id)
+
+    if not download_result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur téléchargement : {download_result['error']}"
+        )
+
+    # --- Étape C : Transcription ---
+    transcribe_result = transcribe_youtube_audio(
+        download_result["audio_path"],
+        source_language=request.source_language
+    )
+
+    if not transcribe_result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur transcription : {transcribe_result['error']}"
+        )
+
+    # On retourne toutes les infos utiles pour vérifier dans Postman
+    return {
+        "success": True,
+        "job_id": job_id,
+        "video_info": {
+            "title": download_result["title"],
+            "duration": download_result["duration"],
+            "channel": download_result["channel"],
+        },
+        "transcription": {
+            "language": transcribe_result["language"],
+            "language_probability": transcribe_result["language_probability"],
+            "segments_count": len(transcribe_result["segments"]),
+            "segments": transcribe_result["segments"]
+            # On retourne TOUS les segments pour pouvoir les vérifier dans Postman
+        }
     }
 
 
