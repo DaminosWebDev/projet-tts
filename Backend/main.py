@@ -77,26 +77,25 @@ logger.info(f"Dossier STT uploads prêt : {STT_UPLOAD_DIR}")
 # automatiquement une erreur 422 avec un message clair
 class TTSRequest(BaseModel):
     text: str = Field(
-        ...,  # "..." signifie que ce champ est obligatoire
+        ...,
         description="Le texte à convertir en audio",
-        example="Bonjour, comment allez-vous ?"
+        json_schema_extra={"example": "Bonjour, comment allez-vous ?"}
     )
     language: str = Field(
-        default="fr",  # Français par défaut
+        default="fr",
         description="La langue du texte : 'fr' pour français, 'en' pour anglais",
-        example="fr"
+        json_schema_extra={"example": "fr"}
     )
     voice: str = Field(
-        default="",  # Vide = voix par défaut définie dans config.py
+        default="",
         description="La voix à utiliser (optionnel)",
-        example="ff_siwis"
+        json_schema_extra={"example": "ff_siwis"}
     )
     speed: float = Field(
         default=1.0,
         description="Vitesse de lecture : 0.5 (lent) à 2.0 (rapide)",
-        example=1.0
+        json_schema_extra={"example": 1.0}
     )
-
 
 # --- Modèle de données pour les réponses ---
 # On définit aussi la structure des réponses pour être cohérent
