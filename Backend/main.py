@@ -5,6 +5,7 @@
 import os
 import logging
 import uvicorn
+import uuid  # Pour générer des identifiants uniques pour les fichiers uploadés
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,10 +14,16 @@ from config import (
     HOST,
     PORT,
     MAX_TEXT_LENGTH,
-    AUDIO_DIR,
+    TTS_OUTPUT_DIR,
+    STT_UPLOAD_DIR,
+    STT_MAX_FILE_SIZE_MB,
     LOG_LEVEL
 )
-from tts_service import generate_audio, get_available_voices
+from tts.tts_service import generate_audio, get_available_voices
+from stt.stt_service import transcribe_audio, get_supported_languages
+from fastapi import File, UploadFile
+import shutil
+# shutil = module Python pour manipuler les fichiers (copier, déplacer, supprimer)
 
 # --- Configuration des logs ---
 # basicConfig configure le format des messages de log
@@ -56,8 +63,11 @@ app.add_middleware(
 # --- Création du dossier audio au démarrage ---
 # On s'assure que le dossier audio_files existe avant de démarrer
 # exist_ok=True = pas d'erreur si le dossier existe déjà
-os.makedirs(AUDIO_DIR, exist_ok=True)
-logger.info(f"Dossier audio prêt : {AUDIO_DIR}")
+os.makedirs(TTS_OUTPUT_DIR, exist_ok=True)
+logger.info(f"Dossier audio prêt : {TTS_OUTPUT_DIR}")
+# Création du dossier uploads STT au démarrage
+os.makedirs(STT_UPLOAD_DIR, exist_ok=True)
+logger.info(f"Dossier STT uploads prêt : {STT_UPLOAD_DIR}")
 
 
 # --- Modèle de données pour les requêtes ---
@@ -116,6 +126,9 @@ def health_check():
     logger.info("Health check appelé")
     return {"status": "ok", "message": "L'API Kokoro TTS est opérationnelle"}
 
+# ===========================================================================
+# ENDPOINTS TTS (Text-to-Speech)
+# ===========================================================================
 
 # --- Endpoint des voix disponibles ---
 # GET /voices → retourne la liste des voix disponibles par langue
@@ -225,7 +238,7 @@ def download_audio(filename: str):
     Télécharge un fichier audio précédemment généré via son nom de fichier.
     """
     # On reconstruit le chemin complet vers le fichier
-    filepath = os.path.join(AUDIO_DIR, filename)
+    filepath = os.path.join(TTS_OUTPUT_DIR, filename)
 
     # Sécurité : on vérifie que le fichier existe avant de le retourner
     if not os.path.exists(filepath):
@@ -241,6 +254,178 @@ def download_audio(filename: str):
         media_type="audio/wav",
         filename=filename
     )
+
+
+# ===========================================================================
+# ENDPOINTS STT (Speech-to-Text)
+# ===========================================================================
+
+# --- Endpoint des langues supportées ---
+@app.get("/stt/languages")
+def list_stt_languages():
+    """
+    Retourne la liste des langues supportées par Faster-Whisper.
+    """
+    languages = get_supported_languages()
+    return {
+        "success": True,
+        "languages": languages
+    }
+
+
+# --- Endpoint upload fichier audio ---
+# POST /stt/upload → reçoit un fichier audio, le transcrit et retourne le texte
+@app.post("/stt/upload")
+async def speech_to_text_upload(
+    file: UploadFile = File(...),
+    # UploadFile = le fichier audio envoyé par l'utilisateur
+    # File(...) = ce champ est obligatoire
+    language: str = "auto"
+    # language = la langue de l'audio, "auto" pour détection automatique
+):
+    """
+    Reçoit un fichier audio, le transcrit avec Faster-Whisper
+    et retourne le texte transcrit avec les timestamps.
+    """
+    logger.info(f"Upload STT reçu | fichier={file.filename} | langue={language}")
+
+    # --- Validation du fichier ---
+    # Vérifie que le fichier est bien un audio
+    allowed_types = ["audio/wav", "audio/wave", "audio/mp3", "audio/mpeg", "audio/ogg", "audio/webm", "audio/m4a"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Format non supporté : {file.content_type}. Utilisez WAV, MP3, OGG, WEBM ou M4A"
+        )
+
+    # Vérifie la taille du fichier
+    # On lit le contenu pour vérifier la taille
+    contents = await file.read()
+    # await = on attend que la lecture soit terminée
+    # read() est asynchrone car le fichier peut être volumineux
+    
+    file_size_mb = len(contents) / (1024 * 1024)
+    # len(contents) = taille en bytes
+    # On divise par 1024*1024 pour avoir des MB
+
+    if file_size_mb > STT_MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fichier trop volumineux : {file_size_mb:.1f}MB. Maximum : {STT_MAX_FILE_SIZE_MB}MB"
+        )
+
+    # --- Sauvegarde temporaire du fichier ---
+    # On sauvegarde le fichier uploadé pour que Faster-Whisper puisse le lire
+    # Faster-Whisper a besoin d'un chemin de fichier, pas de données en mémoire
+    unique_id = str(uuid.uuid4())[:8]
+    # On garde l'extension originale du fichier
+    extension = os.path.splitext(file.filename)[1] or ".wav"
+    # os.path.splitext sépare le nom de l'extension : "audio.mp3" → ("audio", ".mp3")
+    
+    upload_filename = f"upload_{unique_id}{extension}"
+    upload_filepath = os.path.join(STT_UPLOAD_DIR, upload_filename)
+
+    # Écriture du fichier sur le disque
+    with open(upload_filepath, "wb") as f:
+        f.write(contents)
+    # "wb" = write binary (écriture en mode binaire)
+    # Les fichiers audio sont des données binaires, pas du texte
+
+    # --- Transcription ---
+    language_param = None if language == "auto" else language
+    # Si l'utilisateur choisit "auto" on passe None à Faster-Whisper
+    # qui détectera automatiquement la langue
+
+    result = transcribe_audio(upload_filepath, language=language_param)
+
+    # --- Nettoyage du fichier temporaire ---
+    # On supprime le fichier uploadé après la transcription
+    # pour ne pas surcharger le disque
+    try:
+        os.remove(upload_filepath)
+        logger.info(f"Fichier temporaire supprimé : {upload_filename}")
+    except Exception as e:
+        logger.warning(f"Impossible de supprimer le fichier temporaire : {str(e)}")
+
+    # --- Retour de la réponse ---
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la transcription : {result['error']}"
+        )
+
+    logger.info(f"Transcription réussie | langue={result['language']}")
+
+    return {
+        "success": True,
+        "text": result["text"],
+        "language": result["language"],
+        "language_probability": result["language_probability"],
+        "segments": result["segments"],
+        "duration": result["duration"]
+    }
+
+
+# --- Endpoint enregistrement micro ---
+# POST /stt/record → reçoit un audio enregistré depuis le navigateur
+@app.post("/stt/record")
+async def speech_to_text_record(
+    file: UploadFile = File(...),
+    language: str = "auto"
+):
+    """
+    Reçoit un audio enregistré depuis le microphone du navigateur
+    et retourne la transcription.
+    
+    Le navigateur envoie l'audio en format WebM ou WAV selon le navigateur.
+    On traite ça exactement comme un upload classique.
+    """
+    logger.info(f"Enregistrement micro STT reçu | langue={language}")
+
+    # On réutilise la même logique que l'upload
+    # La seule différence c'est le nom de l'endpoint
+    # Le frontend saura distinguer les deux usages
+    
+    contents = await file.read()
+    file_size_mb = len(contents) / (1024 * 1024)
+
+    if file_size_mb > STT_MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Enregistrement trop volumineux : {file_size_mb:.1f}MB. Maximum : {STT_MAX_FILE_SIZE_MB}MB"
+        )
+
+    # Sauvegarde temporaire
+    unique_id = str(uuid.uuid4())[:8]
+    upload_filepath = os.path.join(STT_UPLOAD_DIR, f"record_{unique_id}.webm")
+
+    with open(upload_filepath, "wb") as f:
+        f.write(contents)
+
+    # Transcription
+    language_param = None if language == "auto" else language
+    result = transcribe_audio(upload_filepath, language=language_param)
+
+    # Nettoyage
+    try:
+        os.remove(upload_filepath)
+    except Exception as e:
+        logger.warning(f"Impossible de supprimer l'enregistrement temporaire : {str(e)}")
+
+    if not result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la transcription : {result['error']}"
+        )
+
+    return {
+        "success": True,
+        "text": result["text"],
+        "language": result["language"],
+        "language_probability": result["language_probability"],
+        "segments": result["segments"],
+        "duration": result["duration"]
+    }
 
 
 # --- Point d'entrée du programme ---
