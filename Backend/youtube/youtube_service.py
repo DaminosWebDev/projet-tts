@@ -58,6 +58,31 @@ from faster_whisper import WhisperModel
 # Medium = plus précis = meilleurs timestamps = meilleure synchronisation vidéo
 # Le coût : plus de VRAM GPU, mais on a un bon GPU donc ce n'est pas un problème
 
+import soundfile as sf
+# soundfile = bibliothèque pour lire et écrire des fichiers audio
+# On l'utilise pour sauvegarder chaque segment audio généré par Kokoro
+# en fichier WAV numéroté : segment_001.wav, segment_002.wav, etc.
+# POURQUOI soundfile et pas une autre lib ?
+# C'est déjà utilisé dans tts_service.py, on reste cohérent
+# et c'est la bibliothèque la plus simple pour écrire du WAV depuis numpy
+
+import numpy as np
+# numpy = bibliothèque de calcul numérique
+# Kokoro retourne l'audio sous forme de tableau numpy
+# On en a besoin pour concatener les chunks audio de Kokoro
+# POURQUOI numpy ?
+# Les données audio sont des tableaux de nombres (échantillons)
+# numpy est le standard Python pour manipuler ce type de données
+# Analogie : c'est comme Excel mais pour les mathématiques
+
+from tts.tts_service import get_pipeline_and_voice
+# On importe la fonction qui sélectionne le bon pipeline Kokoro
+# selon la langue — déjà écrite dans tts_service.py
+# POURQUOI réutiliser cette fonction ?
+# Elle gère déjà la logique de sélection de voix FR/EN
+# On ne réécrit pas ce qui existe déjà — principe DRY
+# DRY = Don't Repeat Yourself = ne pas se répéter
+
 from config import (
     YOUTUBE_TEMP_DIR,
     # YOUTUBE_TEMP_DIR = "youtube/temp"
@@ -474,5 +499,226 @@ def transcribe_youtube_audio(audio_path: str, source_language: str = None) -> di
             "segments": [],
             "language": None,
             "language_probability": None,
+            "error": str(e)
+        }
+    
+    # =============================================================================
+    # FONCTION 3 : generate_tts_segments()
+    # Génère un fichier audio WAV par segment traduit avec Kokoro
+    # =============================================================================
+
+def generate_tts_segments(
+    translated_segments: list,
+    job_dir: str,
+    target_language: str = "fr",
+    voice: str = "",
+    speed: float = 1.0
+) -> dict:
+    """
+    Génère un fichier audio WAV pour chaque segment traduit.
+    Utilise Kokoro exactement comme tts_service.py mais segment par segment.
+
+    POURQUOI UN FICHIER PAR SEGMENT et pas un seul long fichier ?
+    On a besoin de placer chaque morceau audio AU BON TIMESTAMP dans la vidéo.
+    Si on génère un seul fichier audio, on ne peut pas contrôler
+    où commence et finit chaque phrase.
+    Exemple :
+    - Segment 1 : start=0s, end=3s → segment_001.wav (3s d'audio)
+    - Segment 2 : start=5s, end=8s → segment_002.wav (3s d'audio)
+    ffmpeg placera segment_001.wav à t=0s et segment_002.wav à t=5s
+
+    Paramètres :
+    ------------
+    translated_segments : list
+        Liste des segments traduits retournés par translate_segments()
+        Chaque segment : {
+            "start": 0.0,
+            "end": 3.2,
+            "duration": 3.2,
+            "original_text": "...",
+            "translated_text": "..."
+        }
+
+    job_dir : str
+        Chemin du dossier de travail du job
+        Ex: "youtube/temp/a3f8c2d1"
+        Les segments audio seront dans "youtube/temp/a3f8c2d1/segments/"
+
+    target_language : str
+        Langue de la traduction = langue du TTS
+        "fr" → pipeline Kokoro français
+        "en" → pipeline Kokoro anglais
+
+    voice : str
+        Voix Kokoro à utiliser ("" = voix par défaut de la langue)
+
+    speed : float
+        Vitesse de lecture TTS (1.0 = normale)
+
+    Retourne : dict
+    ---------------
+    Succès :
+    {
+        "success": True,
+        "segments_dir": "youtube/temp/a3f8c2d1/segments",
+        "audio_segments": [
+            {
+                "index": 0,
+                "start": 0.0,
+                "end": 3.2,
+                "duration": 3.2,
+                "original_text": "...",
+                "translated_text": "...",
+                "audio_path": "youtube/temp/a3f8c2d1/segments/segment_000.wav",
+                "audio_duration": 2.8
+                # audio_duration = durée RÉELLE de l'audio généré par Kokoro
+                # Peut différer de "duration" (durée originale du segment)
+                # C'est cette différence qu'on devra corriger avec le time-stretching
+            },
+            ...
+        ],
+        "error": None
+    }
+    """
+
+    try:
+        # -----------------------------------------------------------------
+        # Création du dossier pour les segments audio
+        # -----------------------------------------------------------------
+        segments_dir = os.path.join(job_dir, "segments")
+        # Résultat : "youtube/temp/a3f8c2d1/segments"
+        os.makedirs(segments_dir, exist_ok=True)
+        logger.info(f"Génération TTS de {len(translated_segments)} segments...")
+
+        # -----------------------------------------------------------------
+        # Sélection du pipeline Kokoro selon la langue cible
+        # -----------------------------------------------------------------
+        pipeline, selected_voice = get_pipeline_and_voice(target_language, voice)
+        # get_pipeline_and_voice retourne :
+        # - pipeline_fr si target_language == "fr"
+        # - pipeline_en sinon
+        # - la voix sélectionnée (par défaut si voice == "")
+        logger.info(f"Pipeline TTS sélectionné | langue={target_language} | voix={selected_voice}")
+
+        # -----------------------------------------------------------------
+        # Génération audio segment par segment
+        # -----------------------------------------------------------------
+        audio_segments = []
+        # Liste qui contiendra les infos de chaque segment généré
+
+        for i, segment in enumerate(translated_segments):
+            # enumerate() donne l'index i ET le segment
+            # i = 0, 1, 2, ... → pour nommer les fichiers segment_000.wav, etc.
+
+            text_to_speak = segment["translated_text"]
+            # C'est le texte traduit qu'on va transformer en audio
+
+            if not text_to_speak.strip():
+                # Si le texte traduit est vide (cas rare mais possible)
+                # on passe ce segment sans générer d'audio
+                logger.warning(f"Segment {i} vide, ignoré")
+                continue
+
+            try:
+                # --- Génération audio avec Kokoro ---
+                # pipeline() retourne un générateur de chunks audio
+                # Même fonctionnement que dans tts_service.py
+                generator = pipeline(
+                    text_to_speak,
+                    voice=selected_voice,
+                    speed=speed
+                )
+
+                # Assemblage des chunks audio en un seul tableau numpy
+                audio_chunks = []
+                for (gs, ps, audio) in generator:
+                    # gs = graphemes (texte du chunk)
+                    # ps = phonemes (représentation phonétique)
+                    # audio = tableau numpy avec les données audio
+                    audio_chunks.append(audio)
+
+                if not audio_chunks:
+                    logger.warning(f"Kokoro n'a rien généré pour le segment {i}")
+                    continue
+
+                # np.concatenate colle tous les morceaux bout à bout
+                # Résultat : un seul tableau numpy = l'audio complet du segment
+                full_audio = np.concatenate(audio_chunks)
+
+                # --- Calcul de la durée réelle de l'audio généré ---
+                # len(full_audio) = nombre d'échantillons audio
+                # 24000 = fréquence d'échantillonnage de Kokoro (24000 Hz)
+                # durée = nombre d'échantillons / fréquence
+                # Ex: 72000 échantillons / 24000 Hz = 3.0 secondes
+                audio_duration = len(full_audio) / 24000
+                # POURQUOI calculer ça ?
+                # Pour le time-stretching à l'étape F :
+                # on compare audio_duration (durée TTS) vs segment["duration"] (durée originale)
+                # Si différence > 20% → on étire/compresse
+
+                # --- Sauvegarde du fichier WAV ---
+                # Nom formaté avec zéros devant pour tri alphabétique correct
+                # segment_000.wav, segment_001.wav, ..., segment_099.wav
+                # POURQUOI les zéros devant ?
+                # Sans eux : segment_1, segment_10, segment_2 (ordre alphabétique cassé)
+                # Avec eux : segment_000, segment_001, segment_002 (ordre correct)
+                segment_filename = f"segment_{i:03d}.wav"
+                # :03d = formate l'entier sur 3 chiffres avec zéros devant
+                # Ex: 0 → "000", 5 → "005", 42 → "042"
+
+                segment_path = os.path.join(segments_dir, segment_filename)
+                sf.write(segment_path, full_audio, 24000)
+                # sf.write(chemin, données_audio, fréquence_échantillonnage)
+                # 24000 Hz = fréquence standard de Kokoro
+
+                logger.info(
+                    f"Segment {i:03d} généré | "
+                    f"durée_originale={segment['duration']:.2f}s | "
+                    f"durée_tts={audio_duration:.2f}s | "
+                    f"texte={text_to_speak[:40]}..."
+                )
+
+                # Ajout des infos du segment à notre liste
+                audio_segments.append({
+                    "index": i,
+                    "start": segment["start"],
+                    # Timestamp de début dans la vidéo originale
+                    "end": segment["end"],
+                    # Timestamp de fin dans la vidéo originale
+                    "duration": segment["duration"],
+                    # Durée ORIGINALE du segment dans la vidéo
+                    "original_text": segment["original_text"],
+                    "translated_text": segment["translated_text"],
+                    "audio_path": segment_path,
+                    # Chemin vers le fichier WAV généré
+                    "audio_duration": round(audio_duration, 3),
+                    # Durée RÉELLE de l'audio TTS généré
+                    # Peut être différente de "duration" !
+                })
+
+            except Exception as e:
+                # Si Kokoro plante sur UN segment, on log et on continue
+                # On ne veut pas que toute la vidéo échoue à cause d'un segment
+                logger.error(f"Erreur génération segment {i} : {str(e)}")
+                continue
+
+        if not audio_segments:
+            raise ValueError("Aucun segment audio généré — tous les segments ont échoué")
+
+        logger.info(f"TTS terminé : {len(audio_segments)}/{len(translated_segments)} segments générés")
+
+        return {
+            "success": True,
+            "segments_dir": segments_dir,
+            "audio_segments": audio_segments,
+            "error": None
+        }
+
+    except Exception as e:
+        logger.error(f"Erreur génération TTS segments : {str(e)}")
+        return {
+            "success": False,
+            "segments_dir": None,
+            "audio_segments": [],
             "error": str(e)
         }

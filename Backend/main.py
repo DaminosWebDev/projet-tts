@@ -53,7 +53,7 @@ from config import (
 # =============================================================================
 from tts.tts_service import generate_audio, get_available_voices
 from stt.stt_service import transcribe_audio, get_supported_languages
-from youtube.youtube_service import download_youtube, transcribe_youtube_audio
+from youtube.youtube_service import download_youtube, transcribe_youtube_audio, generate_tts_segments
 from translation.translate_service import translate_segments, translate_text
 
 
@@ -531,6 +531,27 @@ async def youtube_process(request: YouTubeRequest):
             detail=f"Erreur traduction : {translate_result['error']}"
         )
 
+# --- Étape E : Génération TTS par segment ---
+    tts_result = generate_tts_segments(
+        translated_segments=translate_result["segments"],
+        # La liste des segments traduits de l'étape D
+
+        job_dir=download_result["job_dir"],
+        # Le dossier de travail créé à l'étape B
+
+        target_language=request.target_language,
+        # La langue cible pour choisir le bon pipeline Kokoro
+
+        speed=1.0
+        # Vitesse normale — on laissera l'utilisateur choisir plus tard
+    )
+
+    if not tts_result["success"]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur génération TTS : {tts_result['error']}"
+        )
+
     return {
         "success": True,
         "job_id": job_id,
@@ -548,9 +569,30 @@ async def youtube_process(request: YouTubeRequest):
             "source_lang": translate_result["source_lang"],
             "target_lang": translate_result["target_lang"],
             "segments_count": len(translate_result["segments"]),
-            "segments": translate_result["segments"]
+        },
+        "tts": {
+            "segments_generated": len(tts_result["audio_segments"]),
+            "segments_dir": tts_result["segments_dir"],
+            "segments": [
+                {
+                    "index": s["index"],
+                    "start": s["start"],
+                    "end": s["end"],
+                    "duration_original": s["duration"],
+                    # Durée du segment dans la vidéo originale
+                    "duration_tts": s["audio_duration"],
+                    # Durée de l'audio TTS généré
+                    "difference": round(s["audio_duration"] - s["duration"], 3),
+                    # Différence = ce qu'on devra corriger avec le time-stretching
+                    # Positif = TTS plus long que l'original → compresser
+                    # Négatif = TTS plus court que l'original → étirer
+                    "translated_text": s["translated_text"]
+                }
+                for s in tts_result["audio_segments"]
+            ]
         }
     }
+
 
 # --- Point d'entrée du programme ---
 # Ce bloc s'exécute uniquement quand on lance "python main.py" directement
