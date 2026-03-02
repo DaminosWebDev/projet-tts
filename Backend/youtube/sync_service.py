@@ -44,6 +44,12 @@ import json
 # ffprobe = outil de ffmpeg pour analyser les fichiers audio/vidéo
 
 import shutil
+# shutil = module Python pour manipuler les fichiers
+# On l'utilise dans stretch_audio_segment() pour copier un fichier
+# quand la différence est dans la tolérance et qu'on n'a pas besoin de stretcher
+# POURQUOI shutil.copy2 et pas shutil.copy ?
+# copy2 = copie le fichier ET préserve les métadonnées (dates, permissions)
+# copy  = copie uniquement le contenu
 
 from config import (
     YOUTUBE_OUTPUT_DIR,
@@ -327,50 +333,69 @@ def stretch_audio_segment(
 
 
 # =============================================================================
-# FONCTION 2 : assemble_video()
-# Assemble la vidéo muette + les segments audio TTS avec ffmpeg
+# FONCTION 2 : assemble_audio_track()
+# Assemble tous les segments TTS en une seule piste audio synchronisée
 # =============================================================================
 
-def assemble_video(
-    video_path: str,
+def assemble_audio_track(
     audio_segments: list,
     job_id: str,
-    job_dir: str
+    job_dir: str,
+    total_duration: float
 ) -> dict:
     """
-    Assemble la vidéo finale :
-    1. Applique le time-stretching sur chaque segment audio
-    2. Crée une piste audio complète en plaçant chaque segment
-       au bon timestamp
-    3. Combine la vidéo muette + la piste audio → .mp4 final
+    Assemble tous les segments audio TTS en une seule piste WAV synchronisée.
+    Cette piste sera jouée par le frontend par-dessus la vidéo YouTube en muet.
+
+    POURQUOI PLUS DE VIDÉO ?
+    Avant : on téléchargeait la vidéo (lourd) + on assemblait tout en .mp4
+    Maintenant : on produit juste une piste audio .wav légère
+    Le frontend joue la vidéo YouTube directement (via iframe) + notre audio par dessus
+    Avantages :
+    - Pas de stockage vidéo sur le serveur
+    - Téléchargement 10x plus rapide
+    - Légalement plus propre (on ne stocke pas la vidéo YouTube)
 
     COMMENT FFMPEG POSITIONNE L'AUDIO ?
-    On utilise le filtre "adelay" de ffmpeg qui ajoute un délai
-    au début d'un fichier audio.
-    Ex: segment_000.wav avec adelay=5000ms → commence à t=5s
-    Ensuite "amix" mélange tous les segments sur une seule piste.
+    On utilise le filtre "adelay" qui ajoute un silence au début d'un fichier audio.
+    Ex: segment_000.wav avec adelay=5000ms → ce segment commence à t=5s dans la piste finale
+    Ensuite "amix" mélange tous les segments décalés en une seule piste continue.
+    Analogie : comme coller des post-its sur une frise chronologique,
+    chacun à sa bonne position, puis photographier la frise entière.
 
     Paramètres :
     ------------
-    video_path : str
-        Chemin vers la vidéo SANS son (téléchargée à l'étape B)
-
     audio_segments : list
         Liste des segments audio de generate_tts_segments()
-        Chaque segment contient audio_path, start, end, duration
+        Chaque segment contient : audio_path, start, end, duration, index
 
     job_id : str
-        Identifiant du job (pour nommer le fichier final)
+        Identifiant du job — pour nommer le fichier de sortie
+        Ex: "a3f8c2d1" → fichier "audio_a3f8c2d1.wav"
 
     job_dir : str
         Dossier de travail du job
+        Ex: "youtube/temp/a3f8c2d1"
+        Utilisé pour créer le dossier "stretched" des segments après time-stretching
+
+    total_duration : float
+        Durée totale de la vidéo originale en secondes
+        Ex: 213.0 pour une vidéo de 3min33s
+        Utilisé pour que la piste audio finale ait la bonne durée
 
     Retourne : dict
     ---------------
+    Succès :
     {
         "success": True,
-        "output_path": "youtube/outputs/video_a3f8c2d1.mp4",
+        "output_path": "youtube/outputs/audio_a3f8c2d1.wav",
         "error": None
+    }
+    Échec :
+    {
+        "success": False,
+        "output_path": None,
+        "error": "Message d'erreur"
     }
     """
 
@@ -378,23 +403,27 @@ def assemble_video(
         # -----------------------------------------------------------------
         # Étape 1 : Time-stretching de tous les segments
         # -----------------------------------------------------------------
+        # Chaque segment TTS a une durée différente de la durée originale
+        # On doit les ajuster pour qu'ils s'alignent sur les bons timestamps
         stretched_dir = os.path.join(job_dir, "stretched")
         os.makedirs(stretched_dir, exist_ok=True)
         # Dossier séparé pour les fichiers après stretching
-        # youtube/temp/a3f8c2d1/stretched/
+        # "youtube/temp/a3f8c2d1/stretched/"
 
         logger.info(f"Time-stretching de {len(audio_segments)} segments...")
 
         stretched_segments = []
         for segment in audio_segments:
+
             stretched_path = os.path.join(
                 stretched_dir,
                 f"stretched_{segment['index']:03d}.wav"
+                # :03d = 3 chiffres avec zéros → stretched_000.wav, stretched_001.wav...
             )
 
             stretch_result = stretch_audio_segment(
                 audio_path=segment["audio_path"],
-                # Le fichier WAV généré par Kokoro à l'étape E
+                # Le fichier WAV généré par Kokoro
 
                 target_duration=segment["duration"],
                 # La durée ORIGINALE du segment dans la vidéo
@@ -407,15 +436,18 @@ def assemble_video(
                 stretched_segments.append({
                     **segment,
                     # ** = décompresse le dict segment
-                    # Copie toutes les clés/valeurs existantes
-                    # Puis on ajoute/remplace avec les nouvelles valeurs
+                    # Copie toutes les clés/valeurs existantes du segment original
+                    # Puis on remplace/ajoute les nouvelles valeurs ci-dessous
 
                     "audio_path": stretch_result["output_path"],
-                    # On remplace le chemin par le fichier stretchéé
+                    # On remplace le chemin par le fichier après stretching
+
                     "stretched": stretch_result["stretched"]
+                    # True si stretching appliqué, False si copie simple
                 })
             else:
-                # Si le stretching échoue, on utilise l'audio original
+                # Si le stretching échoue sur UN segment, on utilise l'audio original
+                # On ne veut pas que toute la piste échoue pour un seul segment
                 logger.warning(
                     f"Stretching échoué pour segment {segment['index']}, "
                     f"audio original utilisé"
@@ -428,113 +460,141 @@ def assemble_video(
         # -----------------------------------------------------------------
         # Étape 2 : Construction de la commande ffmpeg d'assemblage
         # -----------------------------------------------------------------
-        # C'est la partie la plus complexe — on construit une commande
-        # ffmpeg avec plusieurs inputs et filtres audio
+        # On construit une piste audio WAV complète en plaçant chaque segment
+        # au bon timestamp avec "adelay" puis en mélangeant avec "amix"
 
-        output_path = os.path.join(YOUTUBE_OUTPUT_DIR, f"video_{job_id}.mp4")
+        output_path = os.path.join(YOUTUBE_OUTPUT_DIR, f"audio_{job_id}.wav")
+        # CHANGEMENT : on produit un .wav au lieu d'un .mp4
+        # "audio_{job_id}.wav" = piste audio finale synchronisée
 
-        # On commence à construire la commande ffmpeg
-        # Structure : ffmpeg -i video.mp4 -i seg1.wav -i seg2.wav ...
-        #             -filter_complex "..." -map 0:v -map "[audio_out]"
-        #             output.mp4
+        # Structure de la commande ffmpeg :
+        # ffmpeg -i seg1.wav -i seg2.wav -i seg3.wav ...
+        #        -filter_complex "[1:a]adelay=0|0[a0];[2:a]adelay=5000|5000[a1];...
+        #                         [a0][a1]...amix=inputs=N[out]"
+        #        -map "[out]" output.wav
 
         cmd = ["ffmpeg", "-y"]
-        # -y = écrase le fichier de sortie sans confirmation
-
-        # --- Ajout de la vidéo muette comme premier input ---
-        cmd += ["-i", video_path]
-        # L'index de cet input sera 0 dans le filtre_complex
+        # -y = écrase le fichier de sortie sans demander confirmation
+        # POURQUOI une liste et pas une string ?
+        # subprocess.run avec une liste gère automatiquement les espaces dans les chemins
+        # Ex: "C:\mon dossier\fichier.wav" ne causerait pas de problème
 
         # --- Ajout de chaque segment audio comme input séparé ---
         for segment in stretched_segments:
             cmd += ["-i", segment["audio_path"]]
-        # Les segments auront les index 1, 2, 3, ... dans filter_complex
+            # -i = input = fichier d'entrée
+            # On ajoute un "-i fichier" pour chaque segment
+            # ffmpeg leur assignera automatiquement les index 0, 1, 2, 3...
 
         # --- Construction du filter_complex ---
-        # filter_complex = ensemble de filtres audio/vidéo enchaînés
-        # C'est comme un câblage de studio d'enregistrement
+        # filter_complex = ensemble de filtres audio enchaînés
+        # C'est la partie la plus complexe de la commande ffmpeg
+        # Analogie : c'est comme le câblage d'une table de mixage audio
 
         filter_parts = []
-        # Liste des filtres, on les assemblera en string à la fin
+        # Liste des filtres — on les assemblera avec ";" à la fin
 
         for i, segment in enumerate(stretched_segments):
-            input_index = i + 1
-            # +1 car l'index 0 est la vidéo, les audios commencent à 1
+            # enumerate() donne l'INDEX (i) et la VALEUR (segment)
 
             delay_ms = int(segment["start"] * 1000)
-            # Conversion des secondes en millisecondes
+            # Conversion secondes → millisecondes
             # adelay attend des millisecondes
             # Ex: start=5.5s → delay_ms=5500ms
 
             filter_parts.append(
-                f"[{input_index}:a]adelay={delay_ms}|{delay_ms}[a{i}]"
-                # [{input_index}:a] = flux audio de l'input {input_index}
-                # adelay={delay_ms}|{delay_ms} = délai en ms pour canal gauche|droit
-                # [a{i}] = nom du flux de sortie de ce filtre
-                # Ex: "[1:a]adelay=5500|5500[a0]"
+                f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}]"
+                # [{i}:a]         = flux audio de l'input numéro i
+                #                   (i=0 → premier segment, i=1 → deuxième, etc.)
+                # adelay={delay_ms}|{delay_ms}
+                #                 = ajoute un silence de delay_ms ms au début
+                #                   Le | sépare canal gauche et canal droit
+                #                   On met la même valeur pour les deux = son centré
+                # [a{i}]          = nom qu'on donne au flux de sortie de ce filtre
+                #                   Ex: [a0], [a1], [a2]...
+                # Exemple complet : "[0:a]adelay=0|0[a0]"
+                #                   "[1:a]adelay=5500|5500[a1]"
             )
 
         # Mélange de tous les flux audio avec amix
         audio_inputs = "".join([f"[a{i}]" for i in range(len(stretched_segments))])
-        # Construit : "[a0][a1][a2]...[aN]"
+        # Construit la string "[a0][a1][a2]...[aN]"
+        # C'est la liste des flux à mélanger
 
         filter_parts.append(
             f"{audio_inputs}amix=inputs={len(stretched_segments)}:"
             f"duration=longest:dropout_transition=0,"
-            f"volume=4.0,"              # ← boost ×4 (tu peux tester 3.0 à 6.0)
-            f"loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]"   # normalisation EBU R128 (standard YouTube)
+            f"loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]"
             # amix = mélange plusieurs flux audio en un seul
-            # inputs = nombre de flux à mélanger
-            # duration=longest = la durée est celle du flux le plus long
-            # dropout_transition=0 = pas de transition en fondu
+            # inputs={N} = nombre de flux à mélanger
+            # duration=longest = la durée finale = celle du flux le plus long
+            #   POURQUOI longest et pas first ?
+            #   "first" = durée du premier segment (trop court)
+            #   "longest" = durée du segment le plus long = couvre toute la vidéo
+            # dropout_transition=0 = pas de fondu quand un flux se termine
+            # loudnorm = normalisation du volume selon le standard EBU R128
+            #   I=-16   = niveau sonore moyen cible (-16 LUFS = standard streaming)
+            #   TP=-1.5 = pic maximum à -1.5 dB (évite la saturation)
+            #   LRA=11  = plage dynamique cible (11 LU = naturel pour la voix)
             # [audio_out] = nom du flux de sortie final
         )
 
         filter_complex = ";".join(filter_parts)
-        # On joint tous les filtres avec ";" = séparateur ffmpeg
+        # On joint tous les filtres avec ";" = séparateur ffmpeg entre les filtres
+        # Résultat ex:
+        # "[0:a]adelay=0|0[a0];[1:a]adelay=5500|5500[a1];[a0][a1]amix=inputs=2:..."
 
         # --- Finalisation de la commande ---
         cmd += [
             "-filter_complex", filter_complex,
-            "-map", "0:v",
-            # -map 0:v = utilise le flux vidéo de l'input 0 (la vidéo)
 
             "-map", "[audio_out]",
-            # -map [audio_out] = utilise notre piste audio assemblée
+            # -map = dit à ffmpeg QUOI inclure dans le fichier de sortie
+            # [audio_out] = notre piste audio assemblée et normalisée
 
-            "-c:v", "copy",
-            # -c:v copy = copie le flux vidéo sans ré-encoder
-            # Beaucoup plus rapide et sans perte de qualité
+            "-ar", "24000",
+            # -ar = audio rate = fréquence d'échantillonnage de sortie
+            # 24000 Hz = fréquence de Kokoro
+            # On garde la même fréquence pour éviter toute conversion inutile
 
-            "-c:a", "aac",
-            # -c:a aac = encode l'audio en AAC
-            # AAC = format audio standard pour les fichiers MP4
+            "-ac", "1",
+            # -ac = audio channels = nombre de canaux
+            # 1 = mono (un seul canal)
+            # POURQUOI mono ?
+            # Kokoro génère du mono, pas besoin de stéréo pour la voix
+            # Fichier plus léger
 
-            "-shortest",
-            # -shortest = arrête quand le flux le plus court se termine
-            # Évite que la vidéo dure trop longtemps si l'audio déborde
+            "-t", str(total_duration),
+            # -t = time = durée maximale du fichier de sortie en secondes
+            # On limite à la durée de la vidéo originale
+            # Évite que la piste audio soit plus longue que la vidéo
 
             output_path
+            # Le fichier WAV de sortie final
         ]
 
-        logger.info(f"Assemblage vidéo finale : {output_path}")
+        logger.info(f"Assemblage piste audio : {output_path}")
 
         # Exécution de la commande ffmpeg
         result = subprocess.run(
             cmd,
             capture_output=True,
+            # capture_output=True = on capture stdout ET stderr
+            # Sans ça ffmpeg afficherait tout dans le terminal
+
             text=True
+            # text=True = retourne des strings au lieu de bytes
         )
 
         if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg assemblage erreur : {result.stderr[-500:]}")
-            # [-500:] = on prend seulement les 500 derniers caractères
-            # stderr peut être très long, on garde l'essentiel
+            # returncode != 0 = ffmpeg a rencontré une erreur
+            # On prend les 500 derniers caractères de stderr car il peut être très long
+            raise RuntimeError(f"ffmpeg erreur : {result.stderr[-500:]}")
 
         if not os.path.exists(output_path):
-            raise FileNotFoundError(f"Vidéo finale introuvable : {output_path}")
+            raise FileNotFoundError(f"Piste audio introuvable : {output_path}")
 
-        logger.info(f"Vidéo finale assemblée avec succès : {output_path}")
+        logger.info(f"Piste audio assemblée avec succès : {output_path}")
 
         return {
             "success": True,
@@ -543,7 +603,7 @@ def assemble_video(
         }
 
     except Exception as e:
-        logger.error(f"Erreur assemblage vidéo : {str(e)}")
+        logger.error(f"Erreur assemblage piste audio : {str(e)}")
         return {
             "success": False,
             "output_path": None,

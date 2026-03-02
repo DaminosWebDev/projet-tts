@@ -35,12 +35,6 @@ import logging
 # - En production on peut envoyer les logs dans un fichier
 # Exemple : logger.info("Téléchargement démarré") → affiche avec timestamp + nom fichier
 
-import uuid
-# uuid = module intégré à Python pour générer des identifiants uniques
-# UUID = Universally Unique Identifier
-# Exemple : str(uuid.uuid4()) → "a3f8c2d1-4b5e-6f7a-8b9c-0d1e2f3a4b5c"
-# On l'utilise pour créer des job_id uniques → évite les conflits entre utilisateurs
-
 import yt_dlp
 # yt_dlp = bibliothèque externe qu'on a installée avec pip
 # C'est l'outil qui télécharge les vidéos YouTube
@@ -148,220 +142,218 @@ logger.info("Modèle Whisper YouTube chargé !")
 
 def download_youtube(url: str, job_id: str) -> dict:
     """
-    Télécharge une vidéo YouTube en deux fichiers séparés :
-    - La vidéo SANS son (.mp4) → pour l'assemblage final avec ffmpeg
-    - L'audio SEUL (.wav)      → pour la transcription avec Faster-Whisper
+    Télécharge UNIQUEMENT l'audio d'une vidéo YouTube en WAV.
+    On ne télécharge plus la vidéo — elle sera jouée directement
+    depuis YouTube en mode muet dans le frontend.
 
-    POURQUOI DEUX TÉLÉCHARGEMENTS SÉPARÉS ?
-    YouTube stocke la vidéo et l'audio dans des flux (streams) séparés.
-    On veut :
-    - Le flux vidéo seul → on supprimera l'audio original dedans
-    - Le flux audio seul → on le transcrit, traduit, et remplace
+    POURQUOI ce changement ?
+    Avant : téléchargement vidéo 4K (500MB+) = 40-50 secondes
+    Après : téléchargement audio seulement (~10MB) = 5-8 secondes
+    Gain : ~40 secondes sur le temps total de traitement
 
     Paramètres :
     ------------
     url : str
-        L'URL complète de la vidéo YouTube
+        URL complète de la vidéo YouTube
         Ex: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
     job_id : str
-        Identifiant unique du job (généré dans main.py avec uuid)
+        Identifiant unique du job, généré dans youtube_router.py
         Ex: "a3f8c2d1"
-        Permet d'organiser les fichiers par job dans youtube/temp/
 
-    Valeur de retour : dict
-    -----------------------
+    Retourne : dict
+    ---------------
     Succès :
     {
         "success": True,
         "job_dir": "youtube/temp/a3f8c2d1",
-        "video_path": "youtube/temp/a3f8c2d1/video.mp4",
         "audio_path": "youtube/temp/a3f8c2d1/audio.wav",
+        "youtube_url": "https://www.youtube.com/watch?v=...",
+        "video_id": "dQw4w9WgXcQ",
         "title": "Titre de la vidéo",
-        "duration": 1234,        ← durée en secondes
+        "duration": 213,
         "channel": "Nom chaîne",
         "error": None
-    }
-    Échec :
-    {
-        "success": False,
-        "error": "Message d'erreur explicite"
-        ... (autres champs à None)
     }
     """
 
     try:
         # -----------------------------------------------------------------
-        # ÉTAPE 1 : Créer le dossier de travail pour ce job
+        # Création du dossier de travail isolé pour ce job
         # -----------------------------------------------------------------
-        # Chaque job a son propre dossier isolé
+        # Chaque job a son propre dossier pour éviter les conflits
+        # si deux utilisateurs traitent des vidéos en même temps
         # Analogie : chaque client a son propre casier dans un vestiaire
-        # youtube/temp/
-        # ├── a3f8c2d1/    ← job 1
-        # │   ├── video.mp4
-        # │   └── audio.wav
-        # └── b4e9f3d2/    ← job 2
-        #     ├── video.mp4
-        #     └── audio.wav
-
         job_dir = os.path.join(YOUTUBE_TEMP_DIR, job_id)
-        # os.path.join construit le chemin compatible avec l'OS
-        # Sur Windows : "youtube\temp\a3f8c2d1"
-        # Sur Linux   : "youtube/temp/a3f8c2d1"
+        # os.path.join = construit le chemin compatible avec l'OS
+        # Windows : "youtube\temp\a3f8c2d1"
+        # Linux   : "youtube/temp/a3f8c2d1"
 
         os.makedirs(job_dir, exist_ok=True)
         # exist_ok=True = pas d'erreur si le dossier existe déjà
+        # utile si on relance le même job (cas de debug)
 
         logger.info(f"Dossier job créé : {job_dir}")
 
-        # Chemins exacts des fichiers qu'on va créer
-        video_path = os.path.join(job_dir, "video.mp4")
         audio_path = os.path.join(job_dir, "audio.wav")
+        # On définit le chemin final du fichier WAV à l'avance
+        # pour pouvoir vérifier qu'il existe après le téléchargement
 
         # -----------------------------------------------------------------
-        # ÉTAPE 2 : Télécharger la vidéo SANS son
+        # Configuration de yt-dlp pour télécharger UNIQUEMENT l'audio
         # -----------------------------------------------------------------
-        # On configure yt-dlp pour ne télécharger QUE le flux vidéo
-        # sans audio — ce sera notre "coquille" visuelle
+        logger.info(f"Téléchargement audio depuis : {url}")
 
-        logger.info(f"Téléchargement vidéo (sans son) depuis : {url}")
-
-        video_opts = {
-            "format": "bestvideo[ext=mp4]/bestvideo",
+        audio_opts = {
+            "format": "bestaudio/best",
             # "format" dit à yt-dlp QUOI télécharger
-            # "bestvideo[ext=mp4]" = meilleure qualité vidéo en format MP4
-            # "/bestvideo" = si pas de MP4 dispo → prend la meilleure vidéo disponible
-            # Le "/" est un opérateur de fallback (repli)
-            # IMPORTANT : "bestvideo" sans audio = flux vidéo seul
+            # "bestaudio" = meilleur flux audio disponible sur YouTube
+            # "/best" = fallback si pas de flux audio séparé disponible
+            # DIFFÉRENCE AVEC AVANT :
+            # Avant on avait deux appels :
+            #   1. "bestvideo[ext=mp4]" → télécharge la vidéo 4K (lourd)
+            #   2. "bestaudio/best"     → télécharge l'audio
+            # Maintenant on fait UN SEUL appel audio → beaucoup plus rapide
 
-            "outtmpl": os.path.join(job_dir, "video.%(ext)s"),
+            "outtmpl": os.path.join(job_dir, "audio.%(ext)s"),
             # "outtmpl" = output template = modèle du nom de fichier de sortie
-            # %(ext)s sera remplacé automatiquement par l'extension réelle
-            # Ex: si yt-dlp télécharge du mp4 → "video.mp4"
-            #     si yt-dlp télécharge du webm → "video.webm"
+            # %(ext)s sera remplacé par l'extension réelle du téléchargement
+            # Ex: si yt-dlp télécharge du webm → "audio.webm"
+            # Le postprocessor ci-dessous le convertira ensuite en "audio.wav"
+
+            "postprocessors": [{
+                # postprocessors = traitements appliqués APRÈS le téléchargement
+                # C'est une liste car on peut chaîner plusieurs traitements
+                # Dans notre cas on n'en a qu'un seul : la conversion en WAV
+
+                "key": "FFmpegExtractAudio",
+                # "FFmpegExtractAudio" = utilise ffmpeg pour extraire/convertir l'audio
+                # yt-dlp appelle ffmpeg automatiquement en arrière-plan
+                # C'est pour ça qu'on avait besoin d'installer ffmpeg !
+
+                "preferredcodec": "wav",
+                # On veut du WAV en sortie
+                # WAV = format audio non compressé = parfait pour Whisper
+                # POURQUOI WAV et pas MP3 ?
+                # WAV = données brutes sans perte = meilleure qualité pour l'IA
+                # MP3 = compressé avec perte = moins bon pour la transcription
+
+                "preferredquality": "192",
+                # Qualité audio en kbps (kilobits par seconde)
+                # 192 = bonne qualité, suffisant pour la transcription vocale
+                # On n'a pas besoin de 320kbps (qualité music) pour Whisper
+            }],
 
             "quiet": True,
             # quiet = True → yt-dlp n'affiche rien dans le terminal
             # Sans ça, yt-dlp afficherait une barre de progression verbeuse
+            # qui polluerait nos logs
 
             "no_warnings": True,
-            # Supprime les avertissements de yt-dlp dans le terminal
+            # Supprime les avertissements de yt-dlp
         }
 
+        # -----------------------------------------------------------------
+        # Téléchargement + extraction des métadonnées en UN SEUL appel
+        # -----------------------------------------------------------------
         video_info = {}
-        # On utilise yt-dlp comme gestionnaire de contexte (with ... as)
-        # C'est comme ouvrir un fichier avec open() — ça gère proprement
-        # l'ouverture et la fermeture des ressources automatiquement
-        with yt_dlp.YoutubeDL(video_opts) as ydl:
+        # Dictionnaire vide qu'on va remplir avec les infos de la vidéo
+
+        with yt_dlp.YoutubeDL(audio_opts) as ydl:
+            # "with ... as ydl" = gestionnaire de contexte
+            # Ouvre yt-dlp, exécute le code dans le bloc, puis ferme proprement
+            # Même principe que "with open(fichier) as f:"
+
             info = ydl.extract_info(url, download=True)
-            # extract_info() fait deux choses à la fois :
-            # 1. Télécharge la vidéo (download=True)
-            # 2. Retourne un dict avec toutes les infos de la vidéo
-            # info contient : titre, durée, chaîne, miniature, etc.
+            # extract_info() fait deux choses simultanément :
+            # 1. Télécharge l'audio (download=True)
+            # 2. Retourne un dict avec TOUTES les métadonnées de la vidéo
+            # Ce dict contient : titre, durée, chaîne, ID, miniature, etc.
+            # AVANTAGE : on récupère les métadonnées GRATUITEMENT
+            # pendant le téléchargement, sans appel réseau supplémentaire
+
+            video_id = info.get("id", "")
+            # "id" = l'identifiant unique YouTube de la vidéo
+            # C'est la partie après "?v=" dans l'URL
+            # Ex: "https://youtube.com/watch?v=dQw4w9WgXcQ" → id = "dQw4w9WgXcQ"
+            # POURQUOI on en a besoin ?
+            # Pour construire l'URL du player YouTube embarqué dans le frontend :
+            # https://www.youtube.com/embed/dQw4w9WgXcQ?mute=1&autoplay=1
+            # C'est cette URL qu'on mettra dans une balise <iframe> sur le site
 
             video_info = {
                 "title": info.get("title", "Sans titre"),
                 # .get("title", "Sans titre") = récupère "title" du dict
                 # Si "title" n'existe pas → retourne "Sans titre" par défaut
+                # C'est plus sûr que info["title"] qui planterait si absent
+
                 "duration": info.get("duration", 0),
-                # durée en secondes (ex: 1234 pour une vidéo de 20min34s)
+                # Durée en secondes
+                # Ex: 213 pour une vidéo de 3min33s
+
                 "channel": info.get("channel", "Inconnu"),
+                # Nom de la chaîne YouTube
+
+                "video_id": video_id,
+                # L'ID extrait ci-dessus
+
+                "youtube_url": url,
+                # On garde l'URL ORIGINALE fournie par l'utilisateur
+                # pour la retourner au frontend qui en aura besoin
+                # pour le player embarqué
             }
 
-        logger.info(f"Vidéo téléchargée : {video_info['title']} ({video_info['duration']}s)")
+        logger.info(f"Audio téléchargé : {video_info['title']} ({video_info['duration']}s)")
 
         # -----------------------------------------------------------------
-        # ÉTAPE 3 : Extraire l'audio SEUL en WAV
+        # Vérification que le fichier WAV a bien été créé
         # -----------------------------------------------------------------
-        # On retélécharge le flux audio et on le convertit en WAV
-        # WAV = format audio non compressé → parfait pour Whisper
-        # POURQUOI WAV et pas MP3 ?
-        # WAV = données brutes, pas de perte de qualité = meilleure transcription
-        # MP3 = compressé avec perte = moins bon pour l'IA
-
-        logger.info("Extraction audio en WAV...")
-
-        audio_opts = {
-            "format": "bestaudio/best",
-            # "bestaudio" = meilleur flux audio disponible
-            # "/best" = fallback si pas d'audio séparé disponible
-
-            "outtmpl": os.path.join(job_dir, "audio.%(ext)s"),
-            # Le fichier sera d'abord téléchargé dans son format original
-            # puis converti en WAV par le postprocessor ci-dessous
-
-            "postprocessors": [{
-                # postprocessors = traitements appliqués APRÈS le téléchargement
-                # C'est une liste car on peut chaîner plusieurs traitements
-                "key": "FFmpegExtractAudio",
-                # "FFmpegExtractAudio" = utilise ffmpeg pour extraire l'audio
-                # C'est pour ça qu'on avait besoin d'installer ffmpeg !
-                # yt-dlp appelle ffmpeg automatiquement en arrière-plan
-
-                "preferredcodec": "wav",
-                # On veut du WAV en sortie
-                # yt-dlp + ffmpeg vont convertir automatiquement
-
-                "preferredquality": "192",
-                # Qualité audio en kbps (kilobits par seconde)
-                # 192 = bonne qualité, suffisant pour la transcription vocale
-            }],
-
-            "quiet": True,
-            "no_warnings": True,
-        }
-
-        with yt_dlp.YoutubeDL(audio_opts) as ydl:
-            ydl.extract_info(url, download=True)
-            # On n'a pas besoin des infos cette fois (déjà récupérées)
-            # On télécharge juste l'audio et le convertit en WAV
-
-        logger.info(f"Audio extrait : {audio_path}")
-
-        # -----------------------------------------------------------------
-        # ÉTAPE 4 : Vérifier que les fichiers existent bien
-        # -----------------------------------------------------------------
-        # Après les téléchargements, on vérifie que les fichiers sont là
-        # Des fois yt-dlp peut échouer silencieusement sans lever d'exception
-
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(
-                f"Fichier vidéo introuvable après téléchargement : {video_path}"
-            )
-            # FileNotFoundError = type d'erreur Python standard pour "fichier manquant"
-            # raise = on "lance" l'erreur → elle sera capturée par le except ci-dessous
-
         if not os.path.exists(audio_path):
+            # yt-dlp peut parfois échouer silencieusement sans lever d'exception
+            # Cette vérification explicite nous protège contre ce cas
             raise FileNotFoundError(
                 f"Fichier audio introuvable après téléchargement : {audio_path}"
             )
+            # raise = on "lance" l'erreur manuellement
+            # Elle sera capturée par le except ci-dessous
 
         # Tout s'est bien passé → on retourne les infos
         return {
             "success": True,
             "job_dir": job_dir,
-            "video_path": video_path,
             "audio_path": audio_path,
+
+            "youtube_url": video_info["youtube_url"],
+            # L'URL YouTube originale
+            # Utilisée par le frontend pour le player iframe
+
+            "video_id": video_info["video_id"],
+            # L'ID YouTube
+            # Permet de construire : youtube.com/embed/{video_id}?mute=1
+
             "title": video_info["title"],
             "duration": video_info["duration"],
             "channel": video_info["channel"],
             "error": None
+            # None = pas d'erreur
         }
 
     except Exception as e:
-        # Exception = capture N'IMPORTE QUELLE erreur qui se produit dans le try
-        # "e" = l'objet erreur, str(e) = son message en texte lisible
-        # On ne laisse pas le serveur planter → on retourne un dict d'échec propre
+        # Exception = capture N'IMPORTE QUELLE erreur du bloc try
+        # str(e) = convertit l'erreur en message texte lisible
         logger.error(f"Erreur téléchargement YouTube : {str(e)}")
         return {
             "success": False,
             "job_dir": None,
-            "video_path": None,
             "audio_path": None,
+            "youtube_url": None,
+            "video_id": None,
             "title": None,
             "duration": None,
             "channel": None,
             "error": str(e)
+            # On retourne le message d'erreur pour que le router
+            # puisse l'afficher dans la réponse HTTP
         }
 
 
@@ -502,10 +494,10 @@ def transcribe_youtube_audio(audio_path: str, source_language: str = None) -> di
             "error": str(e)
         }
     
-    # =============================================================================
-    # FONCTION 3 : generate_tts_segments()
-    # Génère un fichier audio WAV par segment traduit avec Kokoro
-    # =============================================================================
+# =============================================================================
+# FONCTION 3 : generate_tts_segments()
+# Génère un fichier audio WAV par segment traduit avec Kokoro
+# =============================================================================
 
 def generate_tts_segments(
     translated_segments: list,
