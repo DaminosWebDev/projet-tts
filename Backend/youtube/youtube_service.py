@@ -515,72 +515,8 @@ def generate_tts_segments(
     speed: float = 1.0
 ) -> dict:
     """
-    Génère un fichier audio WAV pour chaque segment traduit.
-    Utilise Kokoro exactement comme tts_service.py mais segment par segment.
-
-    POURQUOI UN FICHIER PAR SEGMENT et pas un seul long fichier ?
-    On a besoin de placer chaque morceau audio AU BON TIMESTAMP dans la vidéo.
-    Si on génère un seul fichier audio, on ne peut pas contrôler
-    où commence et finit chaque phrase.
-    Exemple :
-    - Segment 1 : start=0s, end=3s → segment_001.wav (3s d'audio)
-    - Segment 2 : start=5s, end=8s → segment_002.wav (3s d'audio)
-    ffmpeg placera segment_001.wav à t=0s et segment_002.wav à t=5s
-
-    Paramètres :
-    ------------
-    translated_segments : list
-        Liste des segments traduits retournés par translate_segments()
-        Chaque segment : {
-            "start": 0.0,
-            "end": 3.2,
-            "duration": 3.2,
-            "original_text": "...",
-            "translated_text": "..."
-        }
-
-    job_dir : str
-        Chemin du dossier de travail du job
-        Ex: "youtube/temp/a3f8c2d1"
-        Les segments audio seront dans "youtube/temp/a3f8c2d1/segments/"
-
-    target_language : str
-        Langue de la traduction = langue du TTS
-        "fr" → pipeline Kokoro français
-        "en" → pipeline Kokoro anglais
-
-    voice : str
-        Voix Kokoro à utiliser ("" = voix par défaut de la langue)
-
-    speed : float
-        Vitesse de lecture TTS (1.0 = normale)
-
-    Retourne : dict
-    ---------------
-    Succès :
-    {
-        "success": True,
-        "segments_dir": "youtube/temp/a3f8c2d1/segments",
-        "audio_segments": [
-            {
-                "index": 0,
-                "start": 0.0,
-                "end": 3.2,
-                "duration": 3.2,
-                "original_text": "...",
-                "translated_text": "...",
-                "audio_path": "youtube/temp/a3f8c2d1/segments/segment_000.wav",
-                "audio_duration": 2.8
-                # audio_duration = durée RÉELLE de l'audio généré par Kokoro
-                # Peut différer de "duration" (durée originale du segment)
-                # C'est cette différence qu'on devra corriger avec le time-stretching
-            },
-            ...
-        ],
-        "error": None
-    }
+    Génère un fichier audio WAV pour chaque segment traduit avec Kokoro
     """
-
     try:
         # -----------------------------------------------------------------
         # Création du dossier pour les segments audio
@@ -605,7 +541,6 @@ def generate_tts_segments(
         # -----------------------------------------------------------------
         audio_segments = []
         # Liste qui contiendra les infos de chaque segment généré
-
         for i, segment in enumerate(translated_segments):
             # enumerate() donne l'index i ET le segment
             # i = 0, 1, 2, ... → pour nommer les fichiers segment_000.wav, etc.
@@ -613,10 +548,18 @@ def generate_tts_segments(
             text_to_speak = segment["translated_text"]
             # C'est le texte traduit qu'on va transformer en audio
 
-            if not text_to_speak.strip():
-                # Si le texte traduit est vide (cas rare mais possible)
-                # on passe ce segment sans générer d'audio
-                logger.warning(f"Segment {i} vide, ignoré")
+            # ────────────────────────────────────────────────
+            # SOLUTION 1 : Ignorer les segments sans texte utile
+            # ────────────────────────────────────────────────
+            if not text_to_speak.strip() or text_to_speak.lower() in [
+                "[music]", "[musique]", "[intro]", "[instrumental]",
+                "[silence]", "[no speech]", "[background music]"
+            ]:
+                logger.info(
+                    f"Segment {i:03d} ignoré (pas de texte / musique / silence) "
+                    f"→ durée originale {segment.get('duration', 0):.1f}s | "
+                    f"texte='{text_to_speak[:60]}...'"
+                )
                 continue
 
             try:
