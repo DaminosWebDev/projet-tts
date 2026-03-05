@@ -7,14 +7,23 @@
 #    pour qu'il corresponde au timestamp original de la vidéo
 #    On utilise ffmpeg qui a Rubber Band intégré (--enable-librubberband)
 #
-# 2. ASSEMBLAGE FINAL : combiner la vidéo muette + tous les segments
-#    audio TTS positionnés aux bons timestamps → fichier .mp4 final
+# 2. ASSEMBLAGE FINAL : combiner tous les segments audio TTS positionnés
+#    aux bons timestamps → fichier .wav final
 #
 # POURQUOI ffmpeg pour le time-stretching ?
 # Notre ffmpeg est compilé avec --enable-librubberband
 # Rubber Band = algorithme professionnel de time-stretching
 # qui préserve la hauteur de la voix (pas d'effet chipmunk)
 # C'est la même technologie utilisée dans les DAW professionnels
+#
+# CHANGEMENT ÉTAPE H — LOUDNORM 2 PASSES :
+# Avant : loudnorm en une seule passe = estimation approximative car ffmpeg
+#         ne connaît pas la fin du fichier quand il traite le début.
+# Après : passe 1 = mesure les vraies valeurs du fichier (I, TP, LRA, thresh)
+#         passe 2 = applique la normalisation avec ces valeurs mesurées
+#         Résultat : précision ±0.1 LU au lieu de ±3 LU.
+# ANALOGIE : cuisiner avec un thermomètre plutôt qu'à l'œil —
+#            on mesure d'abord, on corrige ensuite.
 # =============================================================================
 
 
@@ -41,7 +50,14 @@ import subprocess
 import json
 # json = module pour lire/écrire du JSON
 # On l'utilise pour parser la sortie de ffprobe
+# ET pour parser les mesures loudnorm retournées par ffmpeg en passe 1
 # ffprobe = outil de ffmpeg pour analyser les fichiers audio/vidéo
+
+import re
+# QU'EST-CE QUE C'EST : Module d'expressions régulières.
+# POURQUOI : La sortie stderr de ffmpeg contient du texte + un bloc JSON.
+#            re.search() permet d'extraire uniquement le bloc JSON des mesures loudnorm.
+# COMMENT : re.search(r'\{[^{}]+\}', stderr) trouve le premier { ... } dans la string.
 
 import shutil
 # shutil = module Python pour manipuler les fichiers
@@ -68,6 +84,20 @@ from config import (
 # =============================================================================
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# CONSTANTES LOUDNORM
+# =============================================================================
+
+# QU'EST-CE QUE C'EST : Cibles de normalisation EBU R128 (standard broadcast européen).
+# POURQUOI les centraliser ici : les deux passes utilisent les mêmes valeurs cibles —
+#   une seule définition évite toute incohérence entre les deux appels ffmpeg.
+# COMMENT : Ces valeurs sont passées comme paramètres au filtre loudnorm de ffmpeg.
+
+LOUDNORM_I   = -16.0  # Loudness intégrée cible en LUFS — standard Spotify/YouTube
+LOUDNORM_TP  = -1.5   # True Peak maximum en dBTP — évite la saturation numérique
+LOUDNORM_LRA = 11.0   # Loudness Range cible en LU — dynamique naturelle pour la voix
 
 
 # =============================================================================
@@ -109,36 +139,13 @@ def get_audio_duration(audio_path: str) -> float:
 
         result = subprocess.run(
             cmd,
-            # cmd = liste de strings = la commande et ses arguments
-            # subprocess.run prend soit une string soit une liste
-            # La liste est recommandée pour éviter les problèmes
-            # avec les espaces dans les chemins de fichiers
-
             capture_output=True,
-            # capture_output=True → capture stdout ET stderr
-            # Sans ça, la sortie s'affiche directement dans le terminal
-            # On veut la récupérer dans result.stdout pour la parser
-
             text=True,
-            # text=True → retourne des strings au lieu de bytes
-            # Plus facile à manipuler
-
             check=True
-            # check=True → lève une exception si le code de retour != 0
-            # Code 0 = succès, autre = erreur
         )
 
-        # Parse le JSON retourné par ffprobe
         data = json.loads(result.stdout)
-        # json.loads = convertit une string JSON en dict Python
-
-        # Récupère la durée du premier flux audio
         duration = float(data["streams"][0]["duration"])
-        # data["streams"] = liste des flux du fichier
-        # [0] = premier flux (l'audio WAV n'a qu'un seul flux)
-        # ["duration"] = durée en secondes sous forme de string
-        # float() = convertit la string en nombre décimal
-
         return duration
 
     except Exception as e:
@@ -199,23 +206,13 @@ def stretch_audio_segment(
     """
 
     try:
-        # Mesure la durée actuelle du fichier audio TTS
         current_duration = get_audio_duration(audio_path)
 
         if current_duration <= 0:
             raise ValueError(f"Durée invalide pour {audio_path} : {current_duration}")
 
-        # Calcul du ratio de stretching
         ratio = target_duration / current_duration
-        # ratio = ce par quoi on multiplie la durée
-        # ratio = 0.8 → on compresse à 80% de la durée (plus rapide)
-        # ratio = 1.2 → on étire à 120% de la durée (plus lent)
-        # ratio = 1.0 → pas de changement
-
-        # Calcul de la différence en pourcentage
         difference_pct = abs(1.0 - ratio)
-        # abs() = valeur absolue (toujours positif)
-        # Ex: ratio=0.8 → difference_pct = abs(1.0 - 0.8) = 0.2 = 20%
 
         logger.info(
             f"Stretching | durée_actuelle={current_duration:.2f}s | "
@@ -227,12 +224,7 @@ def stretch_audio_segment(
         # Vérification de la tolérance
         # -----------------------------------------------------------------
         if difference_pct <= STRETCH_TOLERANCE:
-            # La différence est dans la tolérance (≤20%)
-            # L'oreille humaine ne percevra pas la différence
-            # On copie simplement le fichier sans stretching
             shutil.copy2(audio_path, output_path)
-            # shutil.copy2 = copie le fichier en préservant les métadonnées
-
             logger.info(f"Différence ≤{STRETCH_TOLERANCE:.0%} → copie sans stretching")
             return {
                 "success": True,
@@ -241,23 +233,17 @@ def stretch_audio_segment(
                 "target_duration": target_duration,
                 "ratio": ratio,
                 "stretched": False
-                # False = pas de stretching appliqué
             }
 
         # -----------------------------------------------------------------
         # Limites de stretching pour préserver la qualité
         # -----------------------------------------------------------------
-        # Si le ratio est trop extrême, on le limite
-        # pour éviter une dégradation trop importante
         if ratio < 0.5:
             logger.warning(
                 f"Ratio trop faible ({ratio:.3f}) → limité à 0.5 "
                 f"(compression maximale 50%)"
             )
             ratio = 0.5
-            # On accepte une légère désynchronisation plutôt
-            # qu'une voix incompréhensible
-
         elif ratio > 2.0:
             logger.warning(
                 f"Ratio trop élevé ({ratio:.3f}) → limité à 2.0 "
@@ -265,46 +251,24 @@ def stretch_audio_segment(
             )
             ratio = 2.0
 
-        # -----------------------------------------------------------------
-        # Application du time-stretching avec ffmpeg + Rubber Band
-        # -----------------------------------------------------------------
-        # Le filtre rubberband de ffmpeg prend un paramètre "tempo"
-        # tempo = inverse du ratio de durée
-        # Si on veut que la durée soit × 0.8 → le tempo doit être × 1.25
-        # tempo = 1.0 / ratio
+        # tempo = inverse du ratio
+        # ratio=0.8 → tempo=1.25 (parle 25% plus vite)
+        # ratio=1.2 → tempo=0.833 (parle 17% plus lentement)
         tempo = 1.0 / ratio
-        # Ex: ratio=0.8 → tempo=1.25 (parle 25% plus vite)
-        #     ratio=1.2 → tempo=0.833 (parle 17% plus lentement)
 
         cmd = [
             "ffmpeg",
             "-i", audio_path,
-            # -i = input = fichier d'entrée
-
             "-filter:a", f"rubberband=tempo={tempo:.6f}",
-            # -filter:a = applique un filtre audio
-            # rubberband = le filtre Rubber Band intégré à ffmpeg
-            # tempo={tempo} = facteur de vitesse
-            # :.6f = 6 décimales pour la précision
-
             "-y",
-            # -y = écrase le fichier de sortie sans demander confirmation
-
             output_path
-            # Le fichier WAV de sortie
         ]
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            # returncode != 0 = ffmpeg a rencontré une erreur
             raise RuntimeError(f"ffmpeg erreur : {result.stderr}")
 
-        # Vérification que le fichier de sortie existe
         if not os.path.exists(output_path):
             raise FileNotFoundError(f"Fichier de sortie introuvable : {output_path}")
 
@@ -333,6 +297,194 @@ def stretch_audio_segment(
 
 
 # =============================================================================
+# NOUVEAU — ÉTAPE H : Loudnorm 2 passes
+# =============================================================================
+
+def _loudnorm_pass1(input_path: str) -> dict | None:
+    """
+    Passe 1 : mesure les vraies caractéristiques audio du fichier via ffmpeg.
+
+    QU'EST-CE QUE C'EST : Analyse complète du fichier — ffmpeg le lit en entier
+        et retourne les vraies valeurs I/TP/LRA/thresh dans stderr en JSON.
+    POURQUOI une passe de mesure ?
+        En une seule passe, loudnorm travaille en streaming : il ne connaît pas
+        la fin du fichier quand il traite le début → il estime le gain à appliquer.
+        L'estimation peut être fausse de plusieurs dB selon le contenu.
+        Avec les vraies valeurs mesurées, la passe 2 calcule un gain exact.
+    COMMENT :
+        On passe -f null - comme sortie = on ne produit aucun fichier,
+        on veut uniquement les mesures écrites dans stderr.
+
+    Paramètres :
+    ------------
+    input_path : str
+        Chemin vers le fichier WAV à analyser.
+
+    Retourne : dict ou None
+        Dict avec les 4 valeurs mesurées si succès, None si parsing échoue.
+        Ex: { "measured_I": -23.4, "measured_TP": -1.2,
+              "measured_LRA": 7.8, "measured_thresh": -34.1 }
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-af", (
+            f"loudnorm="
+            f"I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:"
+            f"print_format=json"
+            # print_format=json = demande à ffmpeg d'écrire les mesures en JSON dans stderr
+        ),
+        "-f", "null", "-"
+        # -f null - = sortie nulle, aucun fichier écrit — on veut juste les mesures
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        # Les mesures loudnorm sont dans stderr (comportement ffmpeg, pas un bug)
+        # stderr contient aussi les logs ffmpeg normaux — on cherche le bloc JSON
+        json_match = re.search(r'\{[^{}]+\}', result.stderr, re.DOTALL)
+        # r'\{[^{}]+\}' = pattern regex :
+        #   \{        = accolade ouvrante
+        #   [^{}]+    = un ou plusieurs caractères qui ne sont pas des accolades
+        #   \}        = accolade fermante
+        # re.DOTALL = le point matche aussi les retours à la ligne
+
+        if not json_match:
+            logger.error("loudnorm passe 1 : bloc JSON introuvable dans stderr")
+            return None
+
+        measures = json.loads(json_match.group())
+
+        return {
+            "measured_I":      float(measures["input_i"]),
+            # input_i = loudness intégrée mesurée en LUFS
+            "measured_TP":     float(measures["input_tp"]),
+            # input_tp = true peak mesuré en dBTP
+            "measured_LRA":    float(measures["input_lra"]),
+            # input_lra = loudness range mesurée en LU
+            "measured_thresh": float(measures["input_thresh"]),
+            # input_thresh = seuil de bruit de fond en LUFS
+        }
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.error(f"loudnorm passe 1 : parsing JSON échoué : {e}")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("loudnorm passe 1 : timeout (>120s)")
+        return None
+
+
+def _loudnorm_pass2(input_path: str, output_path: str, measures: dict) -> dict:
+    """
+    Passe 2 : applique la normalisation avec les valeurs mesurées en passe 1.
+
+    QU'EST-CE QUE C'EST : Normalisation précise avec les vraies valeurs du fichier.
+    POURQUOI linear=true ?
+        linear=true = ffmpeg applique un gain linéaire simple (multiplication constante).
+        Sans linear=true = ffmpeg active la compression dynamique, ce qui change
+        le rendu sonore de la voix de manière imprévisible.
+        Pour de la voix TTS, on veut uniquement ajuster le volume, pas la dynamique.
+
+    Paramètres :
+    ------------
+    input_path  : str  — Fichier WAV source.
+    output_path : str  — Fichier WAV normalisé de sortie.
+    measures    : dict — Résultat de _loudnorm_pass1().
+
+    Retourne : dict
+        { "success": True, "output_path": "..." }
+        { "success": False, "error": "..." }
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-af", (
+            f"loudnorm="
+            f"I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:"
+            f"measured_I={measures['measured_I']}:"
+            f"measured_TP={measures['measured_TP']}:"
+            f"measured_LRA={measures['measured_LRA']}:"
+            f"measured_thresh={measures['measured_thresh']}:"
+            f"linear=true"
+            # Les 4 valeurs mesurées + linear=true = gain exact sans compression dynamique
+        ),
+        "-ar", "24000",
+        # On conserve la fréquence d'échantillonnage de Kokoro
+        "-ac", "1",
+        # Mono — cohérent avec la sortie TTS
+        output_path
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return {"success": False, "error": f"loudnorm passe 2 : {result.stderr[-200:]}"}
+        return {"success": True, "output_path": output_path}
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "loudnorm passe 2 : timeout (>120s)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _apply_loudnorm_two_pass(input_path: str, output_path: str) -> dict:
+    """
+    Normalise un fichier audio en deux passes ffmpeg.
+
+    QU'EST-CE QUE C'EST : Orchestration des deux passes — interface interne
+        appelée uniquement par assemble_audio_track().
+    POURQUOI préfixe _ ?
+        Convention Python : _ = fonction interne, pas censée être importée
+        directement depuis l'extérieur du module.
+    COMMENT :
+        1. Passe 1 → mesures JSON
+        2. Si mesures OK → passe 2 avec ces mesures
+        3. Si passe 1 échoue → fallback une seule passe (mieux que rien)
+
+    Paramètres :
+    ------------
+    input_path  : str — Fichier WAV source (mix brut).
+    output_path : str — Fichier WAV normalisé final.
+
+    Retourne : dict
+        { "success": True, "output_path": "...", "passes": 2 }
+        { "success": True, "output_path": "...", "passes": 1 }  ← fallback
+        { "success": False, "error": "..." }
+    """
+    logger.info(f"loudnorm passe 1 : analyse de {os.path.basename(input_path)}")
+    measures = _loudnorm_pass1(input_path)
+
+    if measures is None:
+        # Fallback : une seule passe si la mesure échoue
+        logger.warning("loudnorm passe 1 échouée → fallback une seule passe")
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-af", f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}",
+            "-ar", "24000", "-ac", "1",
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            return {"success": False, "error": f"loudnorm fallback : {result.stderr[-200:]}"}
+        return {"success": True, "output_path": output_path, "passes": 1}
+
+    logger.info(
+        f"loudnorm passe 1 OK → "
+        f"I={measures['measured_I']:.1f} LUFS | "
+        f"TP={measures['measured_TP']:.1f} dBTP | "
+        f"LRA={measures['measured_LRA']:.1f} LU"
+    )
+
+    logger.info(f"loudnorm passe 2 : application → cible {LOUDNORM_I} LUFS")
+    result = _loudnorm_pass2(input_path, output_path, measures)
+
+    if not result["success"]:
+        return result
+
+    return {"success": True, "output_path": output_path, "passes": 2}
+
+
+# =============================================================================
 # FONCTION 2 : assemble_audio_track()
 # Assemble tous les segments TTS en une seule piste audio synchronisée
 # =============================================================================
@@ -356,12 +508,10 @@ def assemble_audio_track(
     - Téléchargement 10x plus rapide
     - Légalement plus propre (on ne stocke pas la vidéo YouTube)
 
-    COMMENT FFMPEG POSITIONNE L'AUDIO ?
-    On utilise le filtre "adelay" qui ajoute un silence au début d'un fichier audio.
-    Ex: segment_000.wav avec adelay=5000ms → ce segment commence à t=5s dans la piste finale
-    Ensuite "amix" mélange tous les segments décalés en une seule piste continue.
-    Analogie : comme coller des post-its sur une frise chronologique,
-    chacun à sa bonne position, puis photographier la frise entière.
+    CHANGEMENT ÉTAPE H :
+    Avant : loudnorm intégré dans le filtre amix (une seule passe → approximatif)
+    Après : amix produit un mix brut, puis _apply_loudnorm_two_pass() normalise
+            avec mesure préalable → précision garantie.
 
     Paramètres :
     ------------
@@ -376,35 +526,20 @@ def assemble_audio_track(
     job_dir : str
         Dossier de travail du job
         Ex: "youtube/temp/a3f8c2d1"
-        Utilisé pour créer le dossier "stretched" des segments après time-stretching
 
     total_duration : float
         Durée totale de la vidéo originale en secondes
-        Ex: 213.0 pour une vidéo de 3min33s
-        Utilisé pour que la piste audio finale ait la bonne durée
 
     Retourne : dict
     ---------------
-    Succès :
-    {
-        "success": True,
-        "output_path": "youtube/outputs/audio_a3f8c2d1.wav",
-        "error": None
-    }
-    Échec :
-    {
-        "success": False,
-        "output_path": None,
-        "error": "Message d'erreur"
-    }
+    Succès : { "success": True, "output_path": "youtube/outputs/audio_xxx.wav", "error": None }
+    Échec  : { "success": False, "output_path": None, "error": "Message d'erreur" }
     """
 
     try:
         # -----------------------------------------------------------------
-        # Étape 1 : Time-stretching de tous les segments
+        # Étape F : Time-stretching de tous les segments (inchangé)
         # -----------------------------------------------------------------
-        # Chaque segment TTS a une durée différente de la durée originale
-        # On doit les ajuster pour qu'ils s'alignent sur les bons timestamps
         stretched_dir = os.path.join(job_dir, "stretched")
         os.makedirs(stretched_dir, exist_ok=True)
         # Dossier séparé pour les fichiers après stretching
@@ -423,31 +558,17 @@ def assemble_audio_track(
 
             stretch_result = stretch_audio_segment(
                 audio_path=segment["audio_path"],
-                # Le fichier WAV généré par Kokoro
-
                 target_duration=segment["duration"],
-                # La durée ORIGINALE du segment dans la vidéo
-                # C'est la durée cible après stretching
-
                 output_path=stretched_path
             )
 
             if stretch_result["success"]:
                 stretched_segments.append({
                     **segment,
-                    # ** = décompresse le dict segment
-                    # Copie toutes les clés/valeurs existantes du segment original
-                    # Puis on remplace/ajoute les nouvelles valeurs ci-dessous
-
                     "audio_path": stretch_result["output_path"],
-                    # On remplace le chemin par le fichier après stretching
-
                     "stretched": stretch_result["stretched"]
-                    # True si stretching appliqué, False si copie simple
                 })
             else:
-                # Si le stretching échoue sur UN segment, on utilise l'audio original
-                # On ne veut pas que toute la piste échoue pour un seul segment
                 logger.warning(
                     f"Stretching échoué pour segment {segment['index']}, "
                     f"audio original utilisé"
@@ -458,143 +579,95 @@ def assemble_audio_track(
                 })
 
         # -----------------------------------------------------------------
-        # Étape 2 : Construction de la commande ffmpeg d'assemblage
+        # Étape G : Assemblage ffmpeg avec adelay + amix
+        # CHANGEMENT : loudnorm retiré du filtre_complex — géré séparément
+        #              en 2 passes après l'assemblage (voir étape H ci-dessous)
         # -----------------------------------------------------------------
-        # On construit une piste audio WAV complète en plaçant chaque segment
-        # au bon timestamp avec "adelay" puis en mélangeant avec "amix"
 
-        output_path = os.path.join(YOUTUBE_OUTPUT_DIR, f"audio_{job_id}.wav")
-        # CHANGEMENT : on produit un .wav au lieu d'un .mp4
-        # "audio_{job_id}.wav" = piste audio finale synchronisée
-
-        # Structure de la commande ffmpeg :
-        # ffmpeg -i seg1.wav -i seg2.wav -i seg3.wav ...
-        #        -filter_complex "[1:a]adelay=0|0[a0];[2:a]adelay=5000|5000[a1];...
-        #                         [a0][a1]...amix=inputs=N[out]"
-        #        -map "[out]" output.wav
+        # Fichier intermédiaire = mix brut avant normalisation loudnorm
+        # POURQUOI séparer mix_path et output_path ?
+        # Les deux passes loudnorm lisent mix_path en entrée et écrivent dans output_path
+        # On ne peut pas lire et écrire le même fichier simultanément avec ffmpeg
+        mix_path = os.path.join(job_dir, f"mix_{job_id}.wav")
 
         cmd = ["ffmpeg", "-y"]
         # -y = écrase le fichier de sortie sans demander confirmation
-        # POURQUOI une liste et pas une string ?
-        # subprocess.run avec une liste gère automatiquement les espaces dans les chemins
-        # Ex: "C:\mon dossier\fichier.wav" ne causerait pas de problème
 
-        # --- Ajout de chaque segment audio comme input séparé ---
         for segment in stretched_segments:
             cmd += ["-i", segment["audio_path"]]
-            # -i = input = fichier d'entrée
-            # On ajoute un "-i fichier" pour chaque segment
-            # ffmpeg leur assignera automatiquement les index 0, 1, 2, 3...
-
-        # --- Construction du filter_complex ---
-        # filter_complex = ensemble de filtres audio enchaînés
-        # C'est la partie la plus complexe de la commande ffmpeg
-        # Analogie : c'est comme le câblage d'une table de mixage audio
+            # -i = input = un fichier par segment
 
         filter_parts = []
-        # Liste des filtres — on les assemblera avec ";" à la fin
 
         for i, segment in enumerate(stretched_segments):
-            # enumerate() donne l'INDEX (i) et la VALEUR (segment)
-
             delay_ms = int(segment["start"] * 1000)
-            # Conversion secondes → millisecondes
-            # adelay attend des millisecondes
-            # Ex: start=5.5s → delay_ms=5500ms
-
+            # Conversion secondes → millisecondes (adelay attend des ms)
             filter_parts.append(
                 f"[{i}:a]adelay={delay_ms}|{delay_ms}[a{i}]"
-                # [{i}:a]         = flux audio de l'input numéro i
-                #                   (i=0 → premier segment, i=1 → deuxième, etc.)
-                # adelay={delay_ms}|{delay_ms}
-                #                 = ajoute un silence de delay_ms ms au début
-                #                   Le | sépare canal gauche et canal droit
-                #                   On met la même valeur pour les deux = son centré
-                # [a{i}]          = nom qu'on donne au flux de sortie de ce filtre
-                #                   Ex: [a0], [a1], [a2]...
-                # Exemple complet : "[0:a]adelay=0|0[a0]"
-                #                   "[1:a]adelay=5500|5500[a1]"
+                # [{i}:a]                = flux audio de l'input numéro i
+                # adelay={delay_ms}|{delay_ms} = silence au début (gauche|droite)
+                # [a{i}]                 = nom du flux de sortie de ce filtre
             )
 
-        # Mélange de tous les flux audio avec amix
         audio_inputs = "".join([f"[a{i}]" for i in range(len(stretched_segments))])
-        # Construit la string "[a0][a1][a2]...[aN]"
-        # C'est la liste des flux à mélanger
+        # Construit "[a0][a1][a2]...[aN]" — liste des flux à mélanger
 
+        # CHANGEMENT vs version précédente :
+        # Avant : f"...amix=...,loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]"
+        # Après : loudnorm retiré ici → appliqué en 2 passes séparées ci-dessous
         filter_parts.append(
             f"{audio_inputs}amix=inputs={len(stretched_segments)}:"
-            f"duration=longest:dropout_transition=0,"
-            f"loudnorm=I=-16:TP=-1.5:LRA=11[audio_out]"
-            # amix = mélange plusieurs flux audio en un seul
-            # inputs={N} = nombre de flux à mélanger
-            # duration=longest = la durée finale = celle du flux le plus long
-            #   POURQUOI longest et pas first ?
-            #   "first" = durée du premier segment (trop court)
-            #   "longest" = durée du segment le plus long = couvre toute la vidéo
+            f"duration=longest:dropout_transition=0[audio_out]"
+            # amix          = mélange N flux audio en un seul
+            # duration=longest = durée finale = celle du flux le plus long
             # dropout_transition=0 = pas de fondu quand un flux se termine
-            # loudnorm = normalisation du volume selon le standard EBU R128
-            #   I=-16   = niveau sonore moyen cible (-16 LUFS = standard streaming)
-            #   TP=-1.5 = pic maximum à -1.5 dB (évite la saturation)
-            #   LRA=11  = plage dynamique cible (11 LU = naturel pour la voix)
-            # [audio_out] = nom du flux de sortie final
+            # [audio_out]   = nom du flux de sortie final
         )
 
         filter_complex = ";".join(filter_parts)
-        # On joint tous les filtres avec ";" = séparateur ffmpeg entre les filtres
-        # Résultat ex:
-        # "[0:a]adelay=0|0[a0];[1:a]adelay=5500|5500[a1];[a0][a1]amix=inputs=2:..."
+        # Joint tous les filtres avec ";" = séparateur ffmpeg
 
-        # --- Finalisation de la commande ---
         cmd += [
             "-filter_complex", filter_complex,
-
             "-map", "[audio_out]",
-            # -map = dit à ffmpeg QUOI inclure dans le fichier de sortie
-            # [audio_out] = notre piste audio assemblée et normalisée
-
             "-ar", "24000",
-            # -ar = audio rate = fréquence d'échantillonnage de sortie
-            # 24000 Hz = fréquence de Kokoro
-            # On garde la même fréquence pour éviter toute conversion inutile
-
+            # 24000 Hz = fréquence de Kokoro — on ne convertit pas encore ici
             "-ac", "1",
-            # -ac = audio channels = nombre de canaux
-            # 1 = mono (un seul canal)
-            # POURQUOI mono ?
-            # Kokoro génère du mono, pas besoin de stéréo pour la voix
-            # Fichier plus léger
-
+            # Mono — Kokoro génère du mono
             "-t", str(total_duration),
-            # -t = time = durée maximale du fichier de sortie en secondes
-            # On limite à la durée de la vidéo originale
-            # Évite que la piste audio soit plus longue que la vidéo
-
-            output_path
-            # Le fichier WAV de sortie final
+            # Limite à la durée de la vidéo originale
+            mix_path
+            # ← mix_path et non output_path : fichier intermédiaire avant loudnorm
         ]
 
-        logger.info(f"Assemblage piste audio : {output_path}")
+        logger.info(f"Assemblage mix brut : {mix_path}")
 
-        # Exécution de la commande ffmpeg
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            # capture_output=True = on capture stdout ET stderr
-            # Sans ça ffmpeg afficherait tout dans le terminal
-
-            text=True
-            # text=True = retourne des strings au lieu de bytes
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
-            # returncode != 0 = ffmpeg a rencontré une erreur
-            # On prend les 500 derniers caractères de stderr car il peut être très long
             raise RuntimeError(f"ffmpeg erreur : {result.stderr[-500:]}")
 
-        if not os.path.exists(output_path):
-            raise FileNotFoundError(f"Piste audio introuvable : {output_path}")
+        if not os.path.exists(mix_path):
+            raise FileNotFoundError(f"Mix brut introuvable : {mix_path}")
 
-        logger.info(f"Piste audio assemblée avec succès : {output_path}")
+        logger.info(f"Mix brut assemblé : {mix_path}")
+
+        # -----------------------------------------------------------------
+        # Étape H : Normalisation loudnorm 2 passes (NOUVEAU)
+        # -----------------------------------------------------------------
+        output_path = os.path.join(YOUTUBE_OUTPUT_DIR, f"audio_{job_id}.wav")
+        os.makedirs(YOUTUBE_OUTPUT_DIR, exist_ok=True)
+
+        logger.info(f"Loudnorm 2 passes : {mix_path} → {output_path}")
+        loudnorm_result = _apply_loudnorm_two_pass(mix_path, output_path)
+
+        if not loudnorm_result["success"]:
+            raise RuntimeError(loudnorm_result["error"])
+
+        logger.info(
+            f"Piste audio finale : {output_path} "
+            f"({loudnorm_result['passes']} passe(s) loudnorm)"
+        )
 
         return {
             "success": True,
@@ -609,4 +682,3 @@ def assemble_audio_track(
             "output_path": None,
             "error": str(e)
         }
-                    

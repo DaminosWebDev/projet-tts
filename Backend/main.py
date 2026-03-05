@@ -30,14 +30,6 @@ from config import (
 )
 
 # =============================================================================
-# SERVICES — chargement des modèles IA en mémoire GPU
-# =============================================================================
-from tts.tts_service import generate_audio, get_available_voices
-from stt.stt_service import transcribe_audio, get_supported_languages
-from youtube.youtube_service import download_youtube, transcribe_youtube_audio, generate_tts_segments
-from youtube.sync_service import assemble_video
-
-# =============================================================================
 # ROUTERS — endpoints organisés par domaine
 # =============================================================================
 from routers.tts_router import router as tts_router
