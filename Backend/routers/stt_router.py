@@ -5,16 +5,72 @@
 import os
 import uuid
 import logging
-from fastapi import APIRouter, HTTPException, File, UploadFile
+from fastapi import APIRouter, HTTPException, File, UploadFile, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc
+
 from stt.stt_service import transcribe_audio, get_supported_languages
 from config import STT_UPLOAD_DIR, STT_MAX_FILE_SIZE_MB
+from database import get_db
+from models.job_stt import JobSTT
+from models.user import User
+from auth.dependencies import get_optional_user
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/stt")
-# prefix="/stt" = tous les endpoints de ce router commencent par /stt
-# Ex: @router.get("/languages") → accessible via GET /stt/languages
 
+
+# ── Fonction utilitaire nettoyage ─────────────────────────────────────────────
+
+async def _cleanup_old_jobs_stt(user_id: str, db: AsyncSession) -> None:
+    """Garde seulement les 5 derniers jobs STT pour un utilisateur."""
+    result = await db.execute(
+        select(JobSTT)
+        .where(JobSTT.user_id == user_id)
+        .order_by(desc(JobSTT.created_at))
+    )
+    jobs = result.scalars().all()
+
+    if len(jobs) > 5:
+        jobs_to_delete = jobs[5:]
+        for job in jobs_to_delete:
+            await db.delete(job)
+        logger.info(f"Nettoyage historique STT : {len(jobs_to_delete)} job(s) supprimé(s)")
+
+
+# ── Fonction utilitaire sauvegarde ────────────────────────────────────────────
+
+async def _save_stt_history(
+    user: User,
+    filename: str,
+    result: dict,
+    db: AsyncSession
+) -> None:
+    """
+    Sauvegarde un job STT dans l'historique de l'utilisateur.
+
+    QU'EST-CE QUE C'EST : Fonction partagée par /upload et /record.
+    POURQUOI séparée : évite la duplication de code entre les deux routes.
+    """
+    try:
+        job = JobSTT(
+            user_id=user.id,
+            filename=filename,
+            detected_language=result.get("language"),
+            transcription_text=result.get("text", "")[:2000],
+            # Limite à 2000 chars pour l'historique
+            # La transcription complète peut être très longue
+        )
+        db.add(job)
+        await db.flush()
+        await _cleanup_old_jobs_stt(user.id, db)
+        logger.info(f"Historique STT sauvegardé pour {user.email}")
+
+    except Exception as e:
+        logger.error(f"Erreur sauvegarde historique STT : {e}")
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/languages")
 def list_stt_languages():
@@ -25,7 +81,9 @@ def list_stt_languages():
 @router.post("/upload")
 async def speech_to_text_upload(
     file: UploadFile = File(...),
-    language: str = "auto"
+    language: str = "auto",
+    current_user: User | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Transcrit un fichier audio uploadé."""
     logger.info(f"Upload STT | fichier={file.filename} | langue={language}")
@@ -59,6 +117,10 @@ async def speech_to_text_upload(
     if not result["success"]:
         raise HTTPException(status_code=500, detail=f"Erreur transcription : {result['error']}")
 
+    # ── Sauvegarde historique (uniquement si connecté) ────────────────────────
+    if current_user:
+        await _save_stt_history(current_user, file.filename, result, db)
+
     logger.info(f"Transcription réussie | langue={result['language']}")
     return {
         "success": True,
@@ -73,7 +135,9 @@ async def speech_to_text_upload(
 @router.post("/record")
 async def speech_to_text_record(
     file: UploadFile = File(...),
-    language: str = "auto"
+    language: str = "auto",
+    current_user: User | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db)
 ):
     """Transcrit un audio enregistré depuis le microphone."""
     logger.info(f"Enregistrement micro STT | langue={language}")
@@ -100,6 +164,15 @@ async def speech_to_text_record(
 
     if not result["success"]:
         raise HTTPException(status_code=500, detail=f"Erreur transcription : {result['error']}")
+
+    # ── Sauvegarde historique (uniquement si connecté) ────────────────────────
+    if current_user:
+        await _save_stt_history(
+            current_user,
+            f"enregistrement_micro_{uuid.uuid4()[:8]}.webm",
+            result,
+            db
+        )
 
     return {
         "success": True,

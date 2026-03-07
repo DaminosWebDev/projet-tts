@@ -1,13 +1,11 @@
 # =============================================================================
 # main.py - Point d'entrée de l'API
 # =============================================================================
-# Ce fichier est volontairement léger — il configure l'application
-# et délègue les endpoints aux routers spécialisés.
-# =============================================================================
 
 import os
 import logging
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -21,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# CONFIG — après logging, avant les services
+# CONFIG
 # =============================================================================
 from config import (
     HOST, PORT,
@@ -30,19 +28,48 @@ from config import (
 )
 
 # =============================================================================
-# ROUTERS — endpoints organisés par domaine
+# BASE DE DONNÉES + MODÈLES
 # =============================================================================
-from routers.tts_router import router as tts_router
-from routers.stt_router import router as stt_router
-from routers.youtube_router import router as youtube_router
+from database import engine
+from models.user import User           # noqa: F401
+from models.job_youtube import JobYoutube  # noqa: F401
+from models.job_tts import JobTTS      # noqa: F401
+from models.job_stt import JobSTT      # noqa: F401
 
 # =============================================================================
-# APPLICATION
+# ROUTERS
+# =============================================================================
+from routers.tts_router import router as tts_router
+from routers.stt_router import router as sst_router
+from routers.youtube_router import router as youtube_router
+from routers.auth_router import router as auth_router
+from routers.user_router import router as users_router
+
+# =============================================================================
+# CYCLE DE VIE — défini AVANT app = FastAPI()
+# =============================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Démarrage ─────────────────────────────────────────────────────────
+    for directory in [TTS_OUTPUT_DIR, STT_UPLOAD_DIR, YOUTUBE_TEMP_DIR, YOUTUBE_OUTPUT_DIR]:
+        os.makedirs(directory, exist_ok=True)
+        logger.info(f"Dossier prêt : {directory}")
+    logger.info("Base de données connectée")
+
+    yield
+
+    # ── Arrêt ─────────────────────────────────────────────────────────────
+    await engine.dispose()
+    logger.info("Connexions base de données fermées")
+
+# =============================================================================
+# APPLICATION — après lifespan
 # =============================================================================
 app = FastAPI(
     title="Kokoro TTS API",
     description="API de synthèse vocale — TTS, STT, et traduction vidéo YouTube",
-    version="1.0.0"
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -54,26 +81,24 @@ app.add_middleware(
 )
 
 # =============================================================================
-# DOSSIERS — créés au démarrage si inexistants
-# =============================================================================
-for directory in [TTS_OUTPUT_DIR, STT_UPLOAD_DIR, YOUTUBE_TEMP_DIR, YOUTUBE_OUTPUT_DIR]:
-    os.makedirs(directory, exist_ok=True)
-    logger.info(f"Dossier prêt : {directory}")
-
-# =============================================================================
 # INCLUSION DES ROUTERS
 # =============================================================================
+app.include_router(auth_router)
+app.include_router(users_router)
 app.include_router(tts_router)
-app.include_router(stt_router)
+app.include_router(sst_router)
 app.include_router(youtube_router)
 
 # =============================================================================
 # ENDPOINT DE SANTÉ
 # =============================================================================
 @app.get("/health")
-def health_check():
-    """Vérifie que l'API est opérationnelle."""
-    return {"status": "ok", "message": "L'API Kokoro TTS est opérationnelle"}
+async def health_check():
+    return {
+        "status": "ok",
+        "message": "L'API Kokoro TTS est opérationnelle",
+        "version": "2.0.0"
+    }
 
 # =============================================================================
 # POINT D'ENTRÉE
