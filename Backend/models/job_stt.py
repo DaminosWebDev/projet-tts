@@ -1,13 +1,3 @@
-"""
-==============================================================================
-models/job_stt.py — Modèle SQLAlchemy de la table "jobs_stt"
-==============================================================================
-RESPONSABILITÉ :
-  Stocker l'historique des transcriptions audio (STT) de chaque utilisateur.
-  On garde les 5 dernières par utilisateur.
-==============================================================================
-"""
-
 import uuid
 from datetime import datetime, timezone
 
@@ -18,15 +8,16 @@ from database import Base
 
 
 class JobSTT(Base):
-
     __tablename__ = "jobs_stt"
 
+    # Clé primaire UUID — généré côté Python pour cohérence avec les autres modèles
     id: Mapped[str] = mapped_column(
         String(36),
         primary_key=True,
         default=lambda: str(uuid.uuid4())
     )
 
+    # Clé étrangère — suppression en cascade si l'utilisateur est supprimé
     user_id: Mapped[str] = mapped_column(
         String(36),
         ForeignKey("users.id", ondelete="CASCADE"),
@@ -34,36 +25,33 @@ class JobSTT(Base):
         index=True
     )
 
+    # Nom original du fichier — affiché dans l'historique utilisateur
     filename: Mapped[str] = mapped_column(
         String(255),
         nullable=False
-        # Nom original du fichier uploadé par l'utilisateur
-        # Ex: "interview.wav", "podcast_episode_12.mp3"
-        # Affiché dans l'historique pour que l'user reconnaisse le fichier
     )
 
+    # Langue détectée par Whisper — None si la détection a échoué
     detected_language: Mapped[str | None] = mapped_column(
         String(10),
         nullable=True,
         default=None
-        # Langue détectée par Whisper
-        # Ex: "fr", "en"
     )
 
+    # Transcription complète — Text car potentiellement très long
     transcription_text: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
         default=None
-        # Le texte transcrit complet
-        # Peut être très long → Text (pas String)
-        # Affiché dans l'historique pour que l'user retrouve sa transcription
     )
 
+    # Horodatage UTC — pour tri et affichage dans l'historique
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc)
     )
 
+    # Relation ORM — permet d'accéder à job.user directement sans requête manuelle
     user: Mapped["User"] = relationship(
         "User",
         back_populates="stt_jobs"

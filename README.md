@@ -1,121 +1,336 @@
-# 🎙️ TTS Project — Text-to-Speech with Kokoro-82M (kokoro 0.9.4)
+# VoxBridge — AI Voice Processing Platform
 
-🇫🇷 [Version française](README.fr.md)
-
-Web application that transforms text into natural audio.
-The user types a text, chooses a language and a voice, and generates an audio file that can be listened to and downloaded.
+A fullstack web application for **text-to-speech synthesis** (TTS), **audio transcription** (STT), and **YouTube video translation** with automatic dubbing.
 
 ---
 
-## 🏗️ Architecture
-```
-User → React (port 5173)
-           ↓ Axios POST /tts
-      FastAPI (port 8000)
-           ↓ Kokoro-82M (kokoro 0.9.4)
-      WAV Audio Generation
-           ↓
-      Player + Download
-```
+## Table of Contents
 
-The project is split into two independent parts communicating via a REST API :
-
-- **Backend** : FastAPI Python API integrating the Kokoro model
-- **Frontend** : React + Vite user interface
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Features](#features)
+- [YouTube Pipeline](#youtube-pipeline)
+- [API Endpoints](#api-endpoints)
+- [Installation](#installation)
+- [Environment Variables](#environment-variables)
+- [Security](#security)
+- [Author](#author)
 
 ---
 
-## 🛠️ Tech Stack
+## Architecture
+
+```
+User
+    │
+    ▼
+React + Vite (port 5173)
+    │  Axios — HTTP requests
+    ▼
+FastAPI (port 8000)
+    ├── /auth      → JWT + Google OAuth 2.0
+    ├── /tts       → Kokoro-82M (speech synthesis)
+    ├── /stt       → Faster-Whisper (transcription)
+    ├── /youtube   → Async translation pipeline
+    └── /users     → User history
+         │
+         ├── PostgreSQL (async SQLAlchemy + Alembic)
+         ├── LibreTranslate (Docker — offline translation)
+         └── ffmpeg + Rubber Band (audio time-stretching)
+```
+
+The backend exposes a REST API. Each feature is isolated in its own router and service — swapping an AI model only affects a single file.
+
+---
+
+## Tech Stack
+
+### Backend
+
+| Technology | Version | Role |
+|---|---|---|
+| Python | 3.10+ | Primary language |
+| FastAPI | — | Async REST API framework |
+| Uvicorn | — | ASGI server |
+| SQLAlchemy | 2.x async | Database ORM |
+| Alembic | — | Schema migrations |
+| PostgreSQL | — | Primary database |
+| Pydantic | v2 | Validation and serialization |
+| Kokoro-82M | 0.9.4 | Text-to-Speech model |
+| Faster-Whisper | — | Speech-to-Text model |
+| LibreTranslate | Docker | Offline translation |
+| ffmpeg + Rubber Band | — | Time-stretching and audio assembly |
+| yt-dlp | — | YouTube audio download |
+| httpx | — | Async HTTP client (LibreTranslate) |
+| python-jose | — | JWT generation and verification |
+| bcrypt | — | Password hashing |
+| soundfile | — | WAV file read/write |
+
+### Frontend
 
 | Technology | Role |
-|------------|------|
-| Python | Backend language |
-| FastAPI | REST API framework |
-| Uvicorn | HTTP server |
-| Pydantic | Data validation |
-| Kokoro v0.19 | Text-to-Speech model |
-| soundfile | Audio file writing |
-| React | Frontend framework |
-| Vite | Build tool |
+|---|---|
+| React | UI framework |
+| Vite | Build tool and dev server |
 | Axios | HTTP requests |
 
 ---
 
-## 📁 Project Structure
+## Project Structure
+
 ```
-TTS PROJECT/
-├── BACKEND/
-│   ├── config.py          → Centralized configuration
-│   ├── tts_service.py     → Kokoro engine
-│   ├── main.py            → FastAPI server
-│   ├── audio_files/       → Generated audio files
-│   ├── requirements.txt   → Python dependencies
-│   └── .env               → Secret variables (not committed)
-└── FRONTEND/
-    └── tts-project/
-        └── src/
-            └── App.jsx    → User interface
+Backend/
+├── main.py                    → FastAPI entry point — routers, CORS, lifespan
+├── config.py                  → Centralized config — all os.getenv() calls
+├── database.py                → Async engine, session, SQLAlchemy Base
+├── alembic.ini                → Alembic configuration
+│
+├── migrations/
+│   └── env.py                 → Alembic ↔ SQLAlchemy models connection
+│
+├── models/
+│   ├── user.py                → User model — auth, OAuth, tokens
+│   ├── job_tts.py             → TTS job history
+│   ├── job_stt.py             → STT job history
+│   └── job_youtube.py         → YouTube job history
+│
+├── schemas/
+│   └── history.py             → Pydantic schemas for history API
+│
+├── auth/
+│   ├── password.py            → bcrypt hashing, verification, password strength
+│   ├── jwt.py                 → JWT token creation and verification
+│   ├── dependencies.py        → get_current_user, get_optional_user, get_current_admin
+│   └── oauth.py               → Google OAuth 2.0 — Authorization Code Flow
+│
+├── routers/
+│   ├── auth_router.py         → /auth — register, login, refresh, OAuth, reset password
+│   ├── tts_router.py          → /tts — speech synthesis, voice list, download
+│   ├── stt_router.py          → /stt — file upload and microphone transcription
+│   ├── youtube_router.py      → /youtube — async pipeline, status polling, final audio
+│   └── users_router.py        → /users — history by type
+│
+├── tts/
+│   └── tts_service.py         → Kokoro engine — FR/EN pipelines, WAV generation
+│
+├── stt/
+│   └── stt_service.py         → Faster-Whisper engine — transcription, languages
+│
+├── youtube/
+│   ├── youtube_service.py     → yt-dlp download, transcription, per-segment TTS
+│   ├── sync_service.py        → ffmpeg time-stretching, amix assembly, 2-pass loudnorm
+│   └── job_manager.py         → In-memory state manager — automatic TTL cleanup
+│
+├── translation/
+│   └── translate_service.py   → Parallel async translation — asyncio.gather
+│
+├── emails/
+│   └── email_service.py       → Email sending (verification, password reset)
+│
+├── audio_files/               → WAV files generated by TTS
+├── uploads/                   → Temporary STT audio files
+└── youtube/
+    ├── temp/                  → Per-job working directories
+    └── outputs/               → Final translated audio tracks
 ```
 
 ---
 
-## 🔌 API Endpoints
+## Features
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Check API status |
-| GET | `/voices` | List available voices |
-| POST | `/tts` | Generate audio file |
-| GET | `/audio/{filename}` | Download audio file |
+### Text-to-Speech (TTS)
+- Voice synthesis in **French** and **English**
+- 11 available voices — 1 FR, 10 EN
+- Playback speed control (0.5× to 2.0×)
+- Direct in-browser audio preview
+- WAV file download
+- Last 5 synthesis jobs in history (authenticated users)
 
-### POST /tts request example
+### Speech-to-Text (STT)
+- Transcription of **uploaded audio files** (WAV, MP3, OGG, WebM, M4A)
+- Transcription **from the microphone** directly in the browser
+- Automatic language detection (99 languages supported by Whisper)
+- **Per-segment timestamps** returned in the response
+- Language detection confidence score
+- Last 5 transcription jobs in history (authenticated users)
+
+### YouTube Pipeline
+- YouTube video translation with **synchronized audio dubbing**
+- Fully **asynchronous** pipeline — no HTTP blocking
+- Real-time progress via status polling
+- The YouTube video plays directly via iframe (muted), only the audio track is replaced
+- Final track **EBU R128 normalized** (2-pass loudnorm — ±0.1 LUFS precision)
+
+### Authentication
+- Registration with email verification
+- JWT login (30min access token + 30-day refresh token)
+- Refresh token rotation on every renewal
+- Google OAuth 2.0 login
+- Password reset via email
+- Server-side password strength validation
+
+---
+
+## YouTube Pipeline
+
+The pipeline transforms a YouTube video into a dubbed audio track in 6 steps.
+
+```
+POST /youtube/process
+    │
+    ├── B — Audio download (yt-dlp → WAV)
+    │
+    ├── C — Transcription (Whisper medium → timestamped segments)
+    │
+    ├── D — Translation (LibreTranslate — up to 80 segments in parallel via asyncio.gather)
+    │
+    ├── E — Speech synthesis (Kokoro — one WAV per segment)
+    │
+    ├── F — Time-stretching (ffmpeg + Rubber Band — fits each segment to its original duration)
+    │
+    └── G+H — Assembly + Normalization
+              adelay positions each segment at its original timestamp
+              amix merges all audio streams
+              2-pass loudnorm → normalized final track
+
+GET /youtube/status/{job_id}   → 0-100% progress + current step name
+GET /youtube/audio/{job_id}    → final WAV track download
+```
+
+**Typical duration:** 2–5 minutes for a 20-minute video.
+
+---
+
+## API Endpoints
+
+### Authentication — `/auth`
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/auth/register` | No | Create account |
+| POST | `/auth/login` | No | Login — returns access + refresh token |
+| POST | `/auth/refresh` | No | Token renewal (with rotation) |
+| GET | `/auth/me` | JWT | Authenticated user profile |
+| POST | `/auth/forgot-password` | No | Send password reset link |
+| POST | `/auth/reset-password` | No | Reset password with email token |
+| GET | `/auth/google/login` | No | Google OAuth authorization URL |
+| GET | `/auth/google/callback` | No | OAuth callback — returns JWT tokens |
+
+### Text-to-Speech — `/tts`
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/voices` | No | List available voices by language |
+| POST | `/tts` | Optional | Generate a WAV file |
+| GET | `/audio/{filename}` | No | Download a generated audio file |
+
 ```json
+// POST /tts — Request body
 {
-    "text": "Hello, this is a test.",
+    "text": "Hello, how are you?",
     "language": "en",
     "voice": "af_heart",
     "speed": 1.0
 }
 ```
 
+### Speech-to-Text — `/stt`
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/stt/languages` | No | Supported languages |
+| POST | `/stt/upload` | Optional | Transcribe an uploaded audio file |
+| POST | `/stt/record` | Optional | Transcribe a microphone recording |
+
+### YouTube — `/youtube`
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/youtube/process` | Optional | Start the pipeline — returns `job_id` (202) |
+| GET | `/youtube/status/{job_id}` | No | Job state and progress |
+| GET | `/youtube/audio/{job_id}` | No | Final audio track (WAV) |
+
+```json
+// POST /youtube/process
+{ "url": "https://www.youtube.com/watch?v=...", "target_language": "fr" }
+
+// GET /youtube/status/{job_id}
+{
+    "job_id": "a3f8c2d1-...",
+    "status": "processing",
+    "current_step": "C_transcribe",
+    "progress": 25,
+    "audio_url": null,
+    "error": null
+}
+```
+
+### History — `/users`
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/users/me/history` | JWT | Last 5 jobs of each type |
+| GET | `/users/me/history/tts` | JWT | Last 5 TTS jobs |
+| GET | `/users/me/history/stt` | JWT | Last 5 STT jobs |
+| GET | `/users/me/history/youtube` | JWT | Last 5 YouTube jobs |
+
 ---
 
-## 🚀 Installation & Setup
+## Installation
 
 ### Prerequisites
+
 - Python 3.10+
 - Node.js 20+
-- NVIDIA GPU (recommended)
+- PostgreSQL
+- ffmpeg compiled with `--enable-librubberband`
+- Docker (for LibreTranslate)
+- NVIDIA GPU recommended (CUDA)
 
-### Backend
+### 1. Backend
+
 ```bash
-# Create and activate virtual environment
+cd Backend
+
+# Create virtual environment
 python -m venv .venv
-.venv\Scripts\activate
+source .venv/bin/activate        # Linux/macOS
+.venv\Scripts\activate           # Windows
 
 # Install dependencies
-cd BACKEND
 pip install -r requirements.txt
 
-# Create .env file
+# Set up environment variables
 cp .env.example .env
-# Add your HF_TOKEN in the .env file
+# Edit .env with your values (see next section)
+
+# Apply database migrations
+alembic upgrade head
 
 # Start the server
 python main.py
 ```
 
-Server runs on `http://localhost:8000`
-Interactive documentation available at `http://localhost:8000/docs`
+Server available at `http://localhost:8000`  
+Interactive API docs at `http://localhost:8000/docs`
 
-### Frontend
+### 2. LibreTranslate (Docker)
+
 ```bash
-cd FRONTEND/tts-project
+docker run -d \
+  -p 5000:5000 \
+  --name libretranslate \
+  libretranslate/libretranslate \
+  --load-only fr,en
+```
 
-# Install dependencies
+### 3. Frontend
+
+```bash
+cd Frontend
+
 npm install
-
-# Start development server
 npm run dev
 ```
 
@@ -123,39 +338,58 @@ Interface available at `http://localhost:5173`
 
 ---
 
-## 🎯 Features
+## Environment Variables
 
-- ✅ Text-to-speech in French and English
-- ✅ Multiple voice selection
-- ✅ Reading speed control
-- ✅ Direct in-browser audio preview
-- ✅ Audio file download
-- ✅ Error handling
-- ✅ Server logs
+```env
+# Database
+DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/voxbridge
+
+# JWT
+JWT_SECRET_KEY=your_long_random_secret_key
+JWT_ALGORITHM=HS256
+
+# Google OAuth
+GOOGLE_CLIENT_ID=your_client_id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your_client_secret
+GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
+
+# HuggingFace (Kokoro model download)
+HF_TOKEN=your_huggingface_token
+
+# LibreTranslate
+LIBRETRANSLATE_URL=http://localhost:5000
+LIBRETRANSLATE_API_KEY=
+
+# Email
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your@email.com
+SMTP_PASSWORD=your_app_password
+
+# AI Models
+STT_MODEL_SIZE=small
+STT_DEVICE=cuda
+STT_COMPUTE_TYPE=float16
+YOUTUBE_WHISPER_MODEL=medium
+```
 
 ---
 
-## 🔒 Security (planned for production)
+## Security
 
-- JWT authentication
-- HTTPS
-- Rate limiting
-- CORS restriction to frontend URL
-
----
-
-## 🗺️ Roadmap
-
-- [ ] Speech-to-Text feature
-- [ ] User account system
-- [ ] Generation history
-- [ ] S3 storage for audio files
-- [ ] Stripe payment system
-- [ ] Voice cloning with XTTS v2
-- [ ] Deployment on AWS EC2
+| Measure | Implementation |
+|---|---|
+| Passwords | bcrypt rounds=12 — ~0.25s per hash |
+| JWT tokens | HS256, 30min access, 30-day refresh with rotation |
+| Email tokens | UUID stored in DB — immediately revocable |
+| Email enumeration | Identical error messages on login and forgot-password |
+| OAuth CSRF | Single-use state token (secrets.token_hex) |
+| MIME types | Explicit allowlist for STT file uploads |
+| DB isolation | Each user can only access their own data |
 
 ---
 
-## 👤 Author
+## Author
 
-**Damien** — Fullstack AI learning project
+**Damien** — Fullstack AI project  
+Built with: FastAPI · SQLAlchemy async · JWT · OAuth 2.0 · AI Models (Whisper, Kokoro) · Audio pipeline (ffmpeg, Rubber Band, EBU R128)

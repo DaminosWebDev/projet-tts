@@ -6,50 +6,33 @@ RESPONSABILITÉS :
   - Créer et stocker les jobs en mémoire (dict Python global)
   - Mettre à jour le statut et la progression de chaque job
   - Exposer des fonctions utilitaires pour lire/écrire l'état d'un job
-
-ANALOGIE :
-  C'est comme un tableau de bord d'aéroport : chaque vol (job) a un statut
-  (en attente, en vol, atterri, annulé). Le tableau est mis à jour en temps
-  réel sans que les passagers (clients HTTP) aient besoin d'appeler l'avion.
-
-POURQUOI CE MODULE EXISTE :
-  Le pipeline YouTube dure 30-180s. Sans ce système, le client HTTP devrait
-  attendre toute la durée → timeout garanti.
-  Avec ce système : POST répond en <100ms avec un job_id, le client poll GET.
+  - Nettoyer automatiquement les jobs expirés (TTL)
 
 CYCLE DE VIE D'UN JOB :
   PENDING → PROCESSING → DONE
   PENDING → PROCESSING → ERROR
+
+TTL (Time-To-Live) :
+  Les jobs terminés (DONE ou ERROR) sont supprimés après JOB_TTL_SECONDS.
+  Le nettoyage tourne en arrière-plan toutes les CLEANUP_INTERVAL_SECONDS.
 ==============================================================================
 """
 
-# ── Imports ───────────────────────────────────────────────────────────────────
-
 import uuid
-# QU'EST-CE QUE C'EST : Génère des identifiants uniques universels (UUID v4).
-# POURQUOI : Chaque job doit avoir un ID non-devinable et sans collision.
-# COMMENT : uuid4() = 128 bits aléatoires → "a3f8c2d1-4b5e-41d4-a716-446655440000"
-
 import time
-# QU'EST-CE QUE C'EST : Module standard pour lire l'heure système.
-# POURQUOI : Horodater création/fin de chaque job (debug, monitoring, TTL futur).
-# COMMENT : time.time() retourne un float = secondes depuis l'epoch Unix (1970-01-01).
-
 import threading
-# QU'EST-CE QUE C'EST : Module de synchronisation multi-thread.
-# POURQUOI : BackgroundTasks FastAPI tourne dans un thread séparé des requêtes GET.
-#            Sans verrou, deux threads pourraient corrompre le dict simultanément.
-# COMMENT : threading.Lock() = mutex — un seul thread à la fois peut modifier _jobs.
-
+import logging
 from typing import Optional, Dict, Any
-# QU'EST-CE QUE C'EST : Annotations de types Python.
-# POURQUOI : Code auto-documenté, erreurs détectées par les IDE et mypy.
-# COMMENT : Optional[X] = X ou None ; Dict[K,V] = dict typé ; Any = type quelconque.
-
 from enum import Enum
-# QU'EST-CE QUE C'EST : Classe de base pour énumérations (constantes nommées).
-# POURQUOI : Éviter les "magic strings" comme "pending" éparpillés dans le code.
-# COMMENT : class JobStatus(str, Enum) → hérite de str pour être sérialisable en JSON.
+
+logger = logging.getLogger(__name__)
+
+
+# ── Constantes TTL ────────────────────────────────────────────────────────────
+
+JOB_TTL_SECONDS = 3600          # 1 heure — durée de vie d'un job terminé
+CLEANUP_INTERVAL_SECONDS = 600  # 10 minutes — fréquence du nettoyage automatique
+
 
 # ── Énumérations ──────────────────────────────────────────────────────────────
 
@@ -61,40 +44,115 @@ class JobStatus(str, Enum):
     - str  → valeurs directement sérialisables JSON sans .value
     - Enum → typage fort, pas de faute de frappe possible
     """
-    PENDING    = "pending"     # Créé, pas encore démarré
-    PROCESSING = "processing"  # Pipeline en cours (étapes B→G)
-    DONE       = "done"        # Terminé avec succès
-    ERROR      = "error"       # Échec (message dans job["error"])
+    PENDING    = "pending"
+    PROCESSING = "processing"
+    DONE       = "done"
+    ERROR      = "error"
 
 
 class PipelineStep(str, Enum):
     """
     Étapes du pipeline YouTube dans l'ordre d'exécution.
-    Utilisées pour afficher la barre de progression côté frontend.
-
-    ANALOGIE : Les étapes d'un vol affiché sur le tableau de bord :
-    "Embarquement → Décollage → Croisière → Atterrissage"
+    Préfixes alphabétiques — ordre visible dans les logs et le frontend.
     """
-    DOWNLOAD   = "B_download"    # Téléchargement audio WAV via yt-dlp
-    TRANSCRIBE = "C_transcribe"  # Transcription Faster-Whisper → segments horodatés
-    TRANSLATE  = "D_translate"   # Traduction LibreTranslate (en parallèle)
-    TTS        = "E_tts"         # Génération TTS Kokoro par segment
-    STRETCH    = "F_stretch"     # Time-stretching ffmpeg + RubberBand
-    ASSEMBLE   = "G_assemble"    # Assemblage piste audio finale + loudnorm 2 passes
+    DOWNLOAD   = "B_download"
+    TRANSCRIBE = "C_transcribe"
+    TRANSLATE  = "D_translate"
+    TTS        = "E_tts"
+    STRETCH    = "F_stretch"
+    ASSEMBLE   = "G_assemble"
+
 
 # ── Stockage global ───────────────────────────────────────────────────────────
 
-# QU'EST-CE QUE C'EST : Dict global contenant TOUS les jobs actifs de l'application.
-# POURQUOI : Solution zéro-dépendance (pas de Redis, pas de DB). Suffisant pour
-#            une instance unique. Attention : données perdues au redémarrage serveur.
-# COMMENT : Clé = job_id (str UUID), Valeur = dict complet du job.
+# Dict global — zéro dépendance externe (pas de Redis, pas de DB).
+# Attention : données perdues au redémarrage serveur.
 _jobs: Dict[str, Dict[str, Any]] = {}
 
-# QU'EST-CE QUE C'EST : Verrou mutex pour accès concurrent à _jobs.
-# POURQUOI : FastAPI lance BackgroundTasks dans un thread pool ; les requêtes GET
-#            arrivent depuis d'autres threads → risque de race condition sans verrou.
-# COMMENT : Utilisé comme "with _lock:" → bloc atomique, un seul thread à la fois.
+# Mutex — protège _jobs contre les race conditions entre threads.
+# BackgroundTasks tourne dans un thread pool séparé des requêtes GET.
 _lock = threading.Lock()
+
+
+# ── TTL — Nettoyage automatique ───────────────────────────────────────────────
+
+def _cleanup_expired_jobs() -> None:
+    """
+    Supprime les jobs terminés (DONE ou ERROR) dont le finished_at
+    dépasse JOB_TTL_SECONDS.
+
+    QU'EST-CE QUE C'EST : Garbage collector des jobs expirés.
+    POURQUOI : Sans nettoyage, _jobs grossit indéfiniment — fuite mémoire lente.
+    COMMENT :
+        1. Calcule le timestamp limite (maintenant - TTL)
+        2. Identifie les jobs expirés (finished_at < cutoff)
+        3. Les supprime sous verrou
+    """
+    cutoff = time.time() - JOB_TTL_SECONDS
+
+    with _lock:
+        expired_ids = [
+            job_id
+            for job_id, job in _jobs.items()
+            if job.get("finished_at") and job["finished_at"] < cutoff
+        ]
+        for job_id in expired_ids:
+            del _jobs[job_id]
+
+    if expired_ids:
+        logger.info(f"TTL cleanup : {len(expired_ids)} job(s) expiré(s) supprimé(s)")
+
+
+def _schedule_cleanup() -> None:
+    """
+    Boucle infinie qui exécute _cleanup_expired_jobs() toutes les
+    CLEANUP_INTERVAL_SECONDS.
+
+    QU'EST-CE QUE C'EST : Le "thread de ménage" — tourne en arrière-plan
+                          pendant toute la durée de vie du serveur.
+    POURQUOI time.sleep() et pas asyncio.sleep() :
+        Ce thread est synchrone — il est lancé avec threading.Thread,
+        pas dans la boucle asyncio. time.sleep() est correct ici.
+    POURQUOI daemon=True (voir _start_cleanup_thread) :
+        Un thread daemon est tué automatiquement quand le processus principal
+        se termine. Sans ça, le serveur ne s'arrêterait jamais proprement.
+    """
+    while True:
+        time.sleep(CLEANUP_INTERVAL_SECONDS)
+        try:
+            _cleanup_expired_jobs()
+        except Exception as e:
+            # Ne jamais laisser une exception tuer le thread de nettoyage
+            logger.error(f"Erreur TTL cleanup : {e}")
+
+
+def _start_cleanup_thread() -> None:
+    """
+    Démarre le thread de nettoyage en arrière-plan au chargement du module.
+
+    QU'EST-CE QUE C'EST : Initialisation unique — appelée une seule fois
+                          quand job_manager.py est importé.
+    POURQUOI daemon=True :
+        Quand FastAPI s'arrête (Ctrl+C ou SIGTERM), Python attend que tous
+        les threads non-daemon se terminent avant de quitter. Un thread qui
+        dort 10 minutes bloquerait l'arrêt. daemon=True = "ce thread n'est
+        pas critique, tue-le avec le processus principal".
+    """
+    cleanup_thread = threading.Thread(
+        target=_schedule_cleanup,
+        daemon=True,
+        name="job-ttl-cleanup"   # Nom visible dans les profilers et les logs système
+    )
+    cleanup_thread.start()
+    logger.info(
+        f"Thread TTL démarré — nettoyage toutes les "
+        f"{CLEANUP_INTERVAL_SECONDS}s, TTL={JOB_TTL_SECONDS}s"
+    )
+
+
+# Démarrage automatique au chargement du module
+_start_cleanup_thread()
+
 
 # ── Fonctions publiques ───────────────────────────────────────────────────────
 
@@ -102,23 +160,11 @@ def create_job(youtube_url: str) -> str:
     """
     Crée un nouveau job en mémoire et retourne son identifiant.
 
-    QU'EST-CE QUE C'EST : Initialisation complète d'un job YouTube.
-    POURQUOI : Centralise la structure d'un job — un seul endroit à modifier si
-               on ajoute un champ.
-    COMMENT : Génère un UUID, construit le dict avec statut PENDING, l'insère
-              dans _jobs de manière thread-safe.
-
     Paramètres :
         youtube_url (str) : URL YouTube soumise par l'utilisateur.
-                            Ex: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
     Retourne :
-        str : UUID v4 du job. Ex: "a3f8c2d1-4b5e-41d4-a716-446655440000"
-
-    Exemple :
-        >>> job_id = create_job("https://youtu.be/dQw4w9WgXcQ")
-        >>> get_job(job_id)["status"]
-        'pending'
+        str : UUID v4 du job.
     """
     job_id = str(uuid.uuid4())
 
@@ -126,16 +172,16 @@ def create_job(youtube_url: str) -> str:
         "job_id":       job_id,
         "status":       JobStatus.PENDING,
         "youtube_url":  youtube_url,
-        "current_step": None,          # Aucune étape en cours au démarrage
-        "progress":     0,             # 0% au démarrage
+        "current_step": None,
+        "progress":     0,
         "created_at":   time.time(),
         "updated_at":   time.time(),
-        "finished_at":  None,          # Rempli à la fin (succès ou erreur)
+        "finished_at":  None,   # Rempli par complete_job() ou fail_job()
         "result": {
-            "video_id":  None,         # Ex: "dQw4w9WgXcQ" — pour l'iframe YouTube
-            "audio_url": None,         # Ex: "/youtube/audio/job_id" — piste WAV traduite
+            "video_id":  None,
+            "audio_url": None,
         },
-        "error": None,                 # Message d'erreur si status == ERROR
+        "error": None,
     }
 
     with _lock:
@@ -148,21 +194,8 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """
     Récupère l'état actuel d'un job par son identifiant.
 
-    QU'EST-CE QUE C'EST : Lecture thread-safe d'un job dans le dict global.
-    POURQUOI : Appelé toutes les 2s par le frontend via GET /youtube/status/{job_id}.
-    COMMENT : Retourne une copie du dict pour éviter les mutations externes
-              hors du verrou.
-
-    Paramètres :
-        job_id (str) : UUID du job.
-
-    Retourne :
-        Optional[Dict] : Copie du dict du job, ou None si job_id inconnu.
-
-    Exemple :
-        >>> job = get_job("a3f8c2d1-...")
-        >>> job["progress"]
-        45
+    Retourne une copie du dict — évite les mutations hors verrou.
+    Retourne None si le job est inconnu ou a été supprimé par le TTL.
     """
     with _lock:
         job = _jobs.get(job_id)
@@ -172,25 +205,11 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
 def update_job_step(job_id: str, step: PipelineStep, progress: int) -> None:
     """
     Met à jour l'étape courante et le pourcentage de progression d'un job.
-
-    QU'EST-CE QUE C'EST : Notification de progression pendant le pipeline.
-    POURQUOI : Permet au frontend d'afficher "Étape C — Transcription… 25%"
-               plutôt qu'un spinner générique.
-    COMMENT : Passe le status à PROCESSING si ce n'est pas encore le cas,
-              met à jour step, progress et updated_at.
-
-    Paramètres :
-        job_id   (str)          : UUID du job.
-        step     (PipelineStep) : Étape courante (ex: PipelineStep.TRANSCRIBE).
-        progress (int)          : Avancement global en % (0-100).
-
-    Exemple :
-        >>> update_job_step(job_id, PipelineStep.TRANSCRIBE, 25)
-        # → status="processing", current_step="C_transcribe", progress=25
+    Passe automatiquement le statut à PROCESSING.
     """
     with _lock:
         if job_id not in _jobs:
-            return  # Job inconnu → on ignore (ne pas crasher le pipeline)
+            return  # Job inconnu ou expiré — ne pas crasher le pipeline
 
         _jobs[job_id]["status"]       = JobStatus.PROCESSING
         _jobs[job_id]["current_step"] = step
@@ -200,54 +219,26 @@ def update_job_step(job_id: str, step: PipelineStep, progress: int) -> None:
 
 def complete_job(job_id: str, video_id: str, audio_url: str) -> None:
     """
-    Marque un job comme terminé avec succès et stocke le résultat final.
-
-    QU'EST-CE QUE C'EST : Finalisation d'un job après traitement complet.
-    POURQUOI : Le frontend poll GET /status jusqu'à voir status="done",
-               puis lit video_id et audio_url pour lancer le player.
-    COMMENT : Status → DONE, progress → 100, résultats stockés, finished_at horodaté.
-
-    Paramètres :
-        job_id    (str) : UUID du job.
-        video_id  (str) : ID YouTube pour l'iframe. Ex: "dQw4w9WgXcQ"
-        audio_url (str) : URL de la piste WAV. Ex: "/youtube/audio/job_id"
-
-    Exemple :
-        >>> complete_job(job_id, "dQw4w9WgXcQ", "/youtube/audio/abc-123")
-        >>> get_job(job_id)["status"]
-        'done'
+    Marque un job comme terminé avec succès.
+    Le job sera supprimé automatiquement après JOB_TTL_SECONDS.
     """
     with _lock:
         if job_id not in _jobs:
             return
 
         _jobs[job_id]["status"]              = JobStatus.DONE
-        _jobs[job_id]["current_step"]        = None   # Plus d'étape active
+        _jobs[job_id]["current_step"]        = None
         _jobs[job_id]["progress"]            = 100
         _jobs[job_id]["updated_at"]          = time.time()
-        _jobs[job_id]["finished_at"]         = time.time()
+        _jobs[job_id]["finished_at"]         = time.time()  # Démarre le TTL
         _jobs[job_id]["result"]["video_id"]  = video_id
         _jobs[job_id]["result"]["audio_url"] = audio_url
 
 
 def fail_job(job_id: str, error_message: str) -> None:
     """
-    Marque un job comme échoué et stocke le message d'erreur.
-
-    QU'EST-CE QUE C'EST : Gestion d'échec du pipeline.
-    POURQUOI : Sans ça, le frontend resterait en polling infini si une étape
-               plante — il doit pouvoir afficher "Erreur : <détail>".
-    COMMENT : Status → ERROR, error stocké, finished_at horodaté.
-
-    Paramètres :
-        job_id        (str) : UUID du job.
-        error_message (str) : Description de l'erreur.
-                              Ex: "yt-dlp: video unavailable"
-
-    Exemple :
-        >>> fail_job(job_id, "LibreTranslate timeout after 30s")
-        >>> get_job(job_id)["status"]
-        'error'
+    Marque un job comme échoué.
+    Le job sera supprimé automatiquement après JOB_TTL_SECONDS.
     """
     with _lock:
         if job_id not in _jobs:
@@ -256,4 +247,36 @@ def fail_job(job_id: str, error_message: str) -> None:
         _jobs[job_id]["status"]      = JobStatus.ERROR
         _jobs[job_id]["error"]       = error_message
         _jobs[job_id]["updated_at"]  = time.time()
-        _jobs[job_id]["finished_at"] = time.time()
+        _jobs[job_id]["finished_at"] = time.time()  # Démarre le TTL
+
+
+def get_stats() -> Dict[str, int]:
+    """
+    Retourne un snapshot des compteurs de jobs par statut.
+
+    Utile pour un endpoint de monitoring (/health ou /admin/stats)
+    sans exposer le contenu des jobs.
+
+    Retourne :
+        {
+            "total":      12,
+            "pending":    1,
+            "processing": 2,
+            "done":       8,
+            "error":      1
+        }
+    """
+    with _lock:
+        stats: Dict[str, int] = {
+            "total":      len(_jobs),
+            "pending":    0,
+            "processing": 0,
+            "done":       0,
+            "error":      0,
+        }
+        for job in _jobs.values():
+            status = job["status"]
+            if status in stats:
+                stats[status] += 1
+
+    return stats
