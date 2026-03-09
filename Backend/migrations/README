@@ -1,0 +1,39 @@
+# Migrations — Alembic
+
+Gestion du schéma PostgreSQL via Alembic.
+
+## Commandes essentielles
+
+# Générer une migration après modification d'un modèle
+alembic revision --autogenerate -m "description du changement"
+
+# Appliquer toutes les migrations en attente
+alembic upgrade head
+
+# Annuler la dernière migration
+alembic downgrade -1
+
+# Voir l'historique des migrations
+alembic history
+
+# Voir la version actuellement appliquée sur la DB
+alembic current
+
+## Règles du projet
+
+- Toujours lancer les commandes depuis le dossier `Backend/`
+- Tout nouveau modèle doit être importé dans `migrations/env.py`
+- Toujours relire le fichier généré dans `versions/` avant de l'appliquer
+- Ne jamais modifier un fichier de migration déjà appliqué en production
+
+## Ajouter un nouveau modèle
+
+1. Créer le fichier dans `models/`
+2. L'importer dans `migrations/env.py`
+3. L'importer dans `main.py` (avec # noqa: F401)
+4. Générer la migration avec `alembic revision --autogenerate`
+
+## Structure
+
+versions/   → fichiers de migration générés automatiquement
+env.py      → configuration Alembic (connexion DB, chargement des modèles)
