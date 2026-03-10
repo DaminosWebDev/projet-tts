@@ -71,12 +71,8 @@ async def speech_to_text_upload(
 ):
     logger.info(f"Upload STT | fichier={file.filename} | langue={language}")
 
-    # Validation du type MIME — liste blanche explicite
-    allowed_types = [
-        "audio/wav", "audio/wave", "audio/mp3", "audio/mpeg",
-        "audio/ogg", "audio/webm", "audio/m4a"
-    ]
-    if file.content_type not in allowed_types:
+    # Vérification souple — accepte audio/webm;codecs=opus et variantes
+    if not any(file.content_type.startswith(t) for t in ["audio/", "video/webm"]):
         raise HTTPException(status_code=400, detail=f"Format non supporté : {file.content_type}")
 
     # Lecture complète en mémoire pour vérifier la taille avant écriture sur disque

@@ -17,7 +17,7 @@ from auth.jwt import create_access_token, create_refresh_token, verify_refresh_t
 from auth.dependencies import get_current_user
 from auth.oauth import get_google_auth_url, exchange_code_for_token, get_google_user_info
 from emails.email_service import send_verification_email, send_reset_password_email
-from config import PASSWORD_RESET_EXPIRE_HOURS
+from config import PASSWORD_RESET_EXPIRE_HOURS, FRONTEND_URL
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -293,7 +293,9 @@ async def google_callback(code: str, state: str, db: AsyncSession = Depends(get_
             user.is_verified = True
         logger.info(f"Connexion Google existante : {email}")
 
-    return TokenResponse(
-        access_token=create_access_token(user.id, user.email),
-        refresh_token=create_refresh_token(user.id),
+    access_token = create_access_token(user.id, user.email)
+    refresh_token = create_refresh_token(user.id)
+    
+    return RedirectResponse(
+        url=f"{FRONTEND_URL}/auth/callback?access_token={access_token}&refresh_token={refresh_token}"
     )

@@ -1,108 +1,184 @@
-// api.js - Toutes les fonctions Axios centralisées
-// Si l'URL de l'API change, on ne modifie que ce fichier
-// Principe de responsabilité unique : ce fichier ne fait QUE parler à l'API
+// services/api.js
+// Tous les appels API — backend FastAPI localhost:8000
 
-// axios est une librairie HTTP qui simplifie les requêtes vers le backend
-// Elle gère automatiquement : la conversion JSON, les headers, les erreurs HTTP
-// Alternative native : fetch(), mais axios est plus lisible et plus pratique
-import axios from 'axios';
-
-// L'URL de base du backend FastAPI
-// On la définit ici UNE SEULE FOIS pour tout le projet
-// En production on changera juste cette ligne pour pointer vers le vrai serveur
-// export = on rend cette variable accessible depuis les autres fichiers
 export const API_URL = 'http://localhost:8000';
 
-// ===========================================================================
-// TTS (Text-to-Speech)
-// ===========================================================================
+// ─── Helper authentifié ───────────────────────────────────────────────────────
 
-// Génère un fichier audio à partir d'un texte
-// Paramètres : objet avec text, language, voice, speed
-// Retourne : la réponse axios complète (avec headers + data blob)
-// On retourne la réponse COMPLÈTE car on a besoin des headers
-// pour récupérer le nom du fichier (x-audio-filename)
-export const generateTTS = async ({ text, language, voice, speed }) => {
-    const response = await axios.post(
-        `${API_URL}/tts`,       // URL de l'endpoint
-        { text, language, voice, speed }, // Body de la requête en JSON
-        { responseType: 'blob' } // Très important : on attend un fichier binaire
-                                 // Sans ça axios essaierait de parser l'audio en JSON → plantage
-    );
-    return response;
-    // On retourne response et pas response.data car on a besoin
-    // de response.headers pour récupérer le nom du fichier audio
+export const authFetch = async (url, options = {}, token) => {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...options.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || `Erreur ${response.status}`);
+  }
+
+  return response.json();
 };
 
-// Récupère la liste des voix disponibles par langue
-// Retourne : { fr: ["ff_siwis"], en: ["af_heart", ...] }
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
+
+export const apiRegister = ({ email, password }) =>
+  authFetch(`${API_URL}/auth/register`, {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+// → { message, email }
+
+export const apiLogin = ({ email, password }) =>
+  authFetch(`${API_URL}/auth/login`, {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+// → { access_token, refresh_token, token_type }
+
+export const apiRefreshToken = (refreshToken) =>
+  authFetch(`${API_URL}/auth/refresh`, {
+    method: 'POST',
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  });
+// → { access_token, refresh_token, token_type }
+
+export const apiGetMe = (token) =>
+  authFetch(`${API_URL}/auth/me`, {}, token);
+// → { id, email, is_verified, avatar_url, created_at }
+
+export const apiForgotPassword = ({ email }) =>
+  authFetch(`${API_URL}/auth/forgot-password`, {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  });
+// → { message }
+
+export const apiResetPassword = ({ token, new_password }) =>
+  authFetch(`${API_URL}/auth/reset-password`, {
+    method: 'POST',
+    body: JSON.stringify({ token, new_password }),
+  });
+// → { message }
+
+export const apiVerifyEmail = (token) =>
+  authFetch(`${API_URL}/auth/verify-email?token=${token}`);
+// → { access_token, refresh_token, token_type }
+
+// Redirige vers le backend qui redirige vers Google OAuth
+export const apiGoogleLogin = () => {
+  window.location.href = `${API_URL}/auth/google`;
+};
+
+export const apiGetHistory = (token) =>
+  authFetch(`${API_URL}/users/me/history`, {}, token);
+
+// ─── TTS ──────────────────────────────────────────────────────────────────────
+
+export const generateTTS = async ({ text, language, voice, speed }, token) => {
+  const response = await fetch(`${API_URL}/tts`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ text, language, voice, speed }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Erreur lors de la génération TTS');
+  }
+
+  const blob = await response.blob();
+  const filename = response.headers.get('x-audio-filename') || 'audio.wav';
+  const audioUrl = URL.createObjectURL(blob);
+  return { filename, audioUrl };
+};
+
 export const fetchVoices = async () => {
-    const response = await axios.get(`${API_URL}/voices`);
-    return response.data;
-    // Ici on retourne response.data directement car on n'a pas besoin des headers
+  const response = await fetch(`${API_URL}/voices`);
+  if (!response.ok) throw new Error('Impossible de récupérer les voix');
+  const data = await response.json();
+  return data.voices || data;
 };
 
-// ===========================================================================
-// STT (Speech-to-Text)
-// ===========================================================================
+// ─── STT ──────────────────────────────────────────────────────────────────────
 
-// Transcrit un fichier audio uploadé par l'utilisateur
-// Paramètres :
-// - file     : l'objet File sélectionné par l'utilisateur (input type="file")
-// - language : "fr", "en", ou "auto" pour détection automatique
-// Retourne : { success, text, language, language_probability, segments, duration }
-export const uploadAudioSTT = async (file, language = 'auto') => {
+export const uploadAudioSTT = async (file, language = 'auto', token) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('language', language);
 
-    // FormData est l'objet JavaScript pour envoyer des fichiers via HTTP
-    // C'est l'équivalent d'un formulaire HTML avec enctype="multipart/form-data"
-    // On ne peut pas envoyer un fichier en JSON simple, il faut du multipart
-    const formData = new FormData();
-    formData.append('file', file);         // Le fichier audio → champ "file" attendu par FastAPI
-    formData.append('language', language); // La langue → champ "language" attendu par FastAPI
+  const response = await fetch(`${API_URL}/stt/upload`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: formData,
+  });
 
-    const response = await axios.post(
-        `${API_URL}/stt/upload`,
-        formData,
-        {
-            headers: {
-                'Content-Type': 'multipart/form-data'
-                // On spécifie le type multipart pour que le serveur sache
-                // qu'il va recevoir un fichier et pas du JSON
-            }
-        }
-    );
-    return response.data;
-    // Ici on retourne response.data car la réponse est du JSON
-    // (pas un blob comme pour le TTS)
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Erreur pendant la transcription');
+  }
+  return response.json();
 };
 
-// Transcrit un audio enregistré depuis le microphone du navigateur
-// Paramètres :
-// - blob     : l'objet Blob créé par MediaRecorder (enregistrement micro)
-// - language : "fr", "en", ou "auto"
-// Retourne : { success, text, language, language_probability, segments, duration }
-export const recordAudioSTT = async (blob, language = 'auto') => {
+export const recordAudioSTT = async (blob, language = 'auto', token) => {
+  // Utilise le mimeType réel du blob enregistré par MediaRecorder
+  const mimeType = blob.type || 'audio/webm';
+  const ext = mimeType.includes('ogg') ? '.ogg' : '.webm';
+  const file = new File([blob], `recording${ext}`, { type: mimeType });
 
-    // On convertit le Blob en File pour pouvoir lui donner un nom
-    // MediaRecorder produit un Blob sans nom, FastAPI a besoin d'un File avec un nom
-    // new File([blob], nom, options) = crée un File à partir d'un Blob
-    const file = new File([blob], 'voice.webm', { type: 'audio/webm' });
-    // 'voice.webm' = nom du fichier (arbitraire mais avec la bonne extension)
-    // 'audio/webm' = format produit par MediaRecorder dans la plupart des navigateurs
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('language', language);
 
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('language', language);
+  const response = await fetch(`${API_URL}/stt/record`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: formData,
+  });
 
-    const response = await axios.post(`${API_URL}/stt/record`, formData);
-    // Pas besoin de spécifier Content-Type ici, axios le détecte automatiquement
-    // quand on passe un FormData
-    return response.data;
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Erreur pendant la transcription');
+  }
+  return response.json();
 };
 
-// Récupère la liste des langues supportées par Faster-Whisper
-// Retourne : [{ code: "fr", label: "Français" }, ...]
-export const fetchSTTLanguages = async () => {
-    const response = await axios.get(`${API_URL}/stt/languages`);
-    return response.data;
+// ─── YOUTUBE ──────────────────────────────────────────────────────────────────
+
+export const startYouTubePipeline = async ({ url, source_language, target_language }, token) => {
+  const response = await fetch(`${API_URL}/youtube/process`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({
+      url,
+      source_language: source_language === 'auto' ? null : source_language,
+      target_language,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Erreur au lancement du pipeline');
+  }
+  return response.json();
 };
+
+export const fetchYouTubeStatus = async (jobId) => {
+  const response = await fetch(`${API_URL}/youtube/status/${jobId}`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Erreur lors du polling');
+  }
+  return response.json();
+};
+
+export const getYouTubeAudioUrl = (jobId) => `${API_URL}/youtube/audio/${jobId}`;
